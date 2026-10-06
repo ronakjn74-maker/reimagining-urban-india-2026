@@ -116,4 +116,95 @@ public class SmokeTests
         var h1 = CanonicalJson.DesignHash(Design(), "r", "o"); var h2 = CanonicalJson.DesignHash(Design(), "r", "o");
         Assert.Equal(h1, h2); Assert.Equal(64, h1.Length);
     }
+
+    // ---- Wall (M3) ----
+
+    static WallPierGeometry WallGeo(double tw = 230, double lw = 4000) =>
+        new WallPierGeometry { Key = new MemberKey { Kind = KeyKind.Pier, Story = "GF", Label = "P1" }, Storey = "GF", Tw_mm = tw, Lw_mm = lw };
+
+    static WallPierDesignRecord WallDesign(bool be = true, double? beLen = 600, double vu = 400, double? fck = 30) =>
+        new WallPierDesignRecord
+        {
+            Key = new MemberKey { Kind = KeyKind.Pier, Story = "GF", Label = "P1" }, Fck_MPa = fck, Fy_MPa = 500,
+            RhoVReq_pct = 0.3, RhoHReq_pct = 0.3, BoundaryElementRequired = be, BoundaryElementLength_mm = beLen,
+            Envelope = new WallVuCombo { Combo = "ULS-7", Vu_kN = vu }, Prov = new Provenance { FileSha256 = "x" }
+        };
+
+    static (WallDetail Detail, MemberState State, System.Collections.Generic.IReadOnlyList<Finding> Findings) RunWall(WallPierDesignRecord d, WallPierGeometry g = null)
+    {
+        var office = new OfficeSettings();
+        return DetailerPipeline.DetailWall(g ?? WallGeo(), d, RuleSetFactory.For(SeismicCategory.ZoneIII, office), office);
+    }
+
+    [Fact]
+    public void Wall_rule_values_match_appendix_c()
+    {
+        Assert.Equal(57.5, Is13920.ConfiningSpacing(230, 16).Value);                 // min(B/4, 6db, 100) = min(57.5,96,100)
+    }
+
+    [Fact]
+    public void Wall_zones_are_ordered_be_web_be()
+    {
+        var r = RunWall(WallDesign());
+        Assert.Equal(MemberState.Ready, r.State);
+        Assert.Equal(3, r.Detail.Zones.Count);
+        Assert.Equal(WallZoneKind.BoundaryElement, r.Detail.Zones[0].Kind);
+        Assert.Equal(WallZoneKind.Web, r.Detail.Zones[1].Kind);
+        Assert.Equal(WallZoneKind.BoundaryElement, r.Detail.Zones[2].Kind);
+        Assert.Equal(0, r.Detail.Zones[0].From_mm);
+        Assert.Equal(r.Detail.Lw_mm, r.Detail.Zones[2].To_mm);
+    }
+
+    [Fact]
+    public void Wall_missing_be_length_is_incomplete()
+    {
+        var r = RunWall(WallDesign(beLen: null));
+        Assert.Equal(MemberState.Incomplete, r.State);
+        Assert.Contains(r.Findings, f => f.Status == Status.Incomplete && f.Message.Contains("BE length not supplied"));
+    }
+
+    [Fact]
+    public void Wall_shear_gate_fails_for_very_high_vu()
+    {
+        var r = RunWall(WallDesign(vu: 100000));
+        Assert.Equal(MemberState.Review, r.State);
+        Assert.Contains(r.Findings, f => f.Status == Status.Failed && f.Gate == "G5");
+    }
+
+    [Fact]
+    public void Wall_shear_gate_passes_for_modest_vu()
+    {
+        var r = RunWall(WallDesign(vu: 50));
+        Assert.Equal(MemberState.Ready, r.State);
+        Assert.DoesNotContain(r.Findings, f => f.Status == Status.Failed && f.Gate == "G5");
+    }
+
+    [Fact]
+    public void Wall_without_boundary_element_has_single_web_zone()
+    {
+        var r = RunWall(WallDesign(be: false, beLen: null));
+        Assert.Equal(MemberState.Ready, r.State);
+        Assert.Single(r.Detail.Zones);
+        Assert.Equal(WallZoneKind.Web, r.Detail.Zones[0].Kind);
+    }
+
+    [Fact]
+    public void Pier_multi_leg_matching_apportions_by_stiffness()
+    {
+        var legA = Geo(cx: 1000, cy: 0, b: 230, d: 2000);
+        var legB = Geo(cx: 1000, cy: 0, b: 230, d: 1000);
+        var legs = new[] { legA, legB };
+        var m = MemberMatcher.MatchPierLegs(legs, 3000, 230);
+        Assert.NotNull(m);
+        Assert.Equal(2, m.Count);
+        Assert.True(m[0].Item2 > m[1].Item2);                 // longer leg carries more stiffness share
+        Assert.Equal(1.0, m[0].Item2 + m[1].Item2, 6);
+    }
+
+    [Fact]
+    public void Pier_multi_leg_matching_rejects_mismatched_sum()
+    {
+        var legs = new[] { Geo(cx: 1000, cy: 0, b: 230, d: 1000) };
+        Assert.Null(MemberMatcher.MatchPierLegs(legs, 3000, 230));
+    }
 }

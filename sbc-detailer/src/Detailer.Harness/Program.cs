@@ -54,6 +54,42 @@ static class Program
         Console.WriteLine("imported " + c.Key + " As=" + c.Envelope.AsRequired_mm2 + " Avs=" + c.Envelope.AvsMajor_mm2_per_m + "/" + c.Envelope.AvsMinor_mm2_per_m + " Vu2=" + c.Envelope.Vu2_kN + " warnings: " + string.Join("; ", imp.Warnings));
 
         bool ok = r1.State == MemberState.Ready && r2.State == MemberState.Incomplete && c.Envelope.AsRequired_mm2 == 3200;
+
+        Console.WriteLine();
+        Console.WriteLine("=== RUN 4: shear wall, tw=230, lw=4000, Zone III, BE required, BE length=600");
+        var wg = new WallPierGeometry { Key = new MemberKey { Kind = KeyKind.Pier, Story = "GF", Label = "P1" }, Storey = "GF", Tw_mm = 230, Lw_mm = 4000 };
+        var wd = new WallPierDesignRecord
+        {
+            Key = wg.Key, Fck_MPa = 30, Fy_MPa = 500, RhoVReq_pct = 0.3, RhoHReq_pct = 0.3,
+            BoundaryElementRequired = true, BoundaryElementLength_mm = 600,
+            Envelope = new WallVuCombo { Combo = "ULS-7", Vu_kN = 400 },
+            Prov = new Provenance { Source = DesignSource.EtabsDesign, FileSha256 = "sample" }
+        };
+        var w1 = DetailerPipeline.DetailWall(wg, wd, rules, office);
+        Console.WriteLine("STATE: " + w1.State);
+        if (w1.Detail != null)
+            foreach (var z in w1.Detail.Zones)
+                Console.WriteLine(string.Format("  {0,-16} {1,6:0}-{2,-6:0}  vert T{3}@{4}  horiz T{5}@{6}{7}",
+                    z.Kind, z.From_mm, z.To_mm, z.VertDia, z.VertSpacing_mm, z.HorizDia, z.HorizSpacing_mm,
+                    z.TieDia.HasValue ? string.Format("  tie T{0}@{1}", z.TieDia, z.TieSpacing_mm) : ""));
+        foreach (var f in w1.Findings) Console.WriteLine("  " + f);
+        ok &= w1.State == MemberState.Ready;
+
+        Console.WriteLine();
+        Console.WriteLine("=== RUN 5: same wall, BE required but BE length not supplied");
+        var wd2 = new WallPierDesignRecord
+        {
+            Key = wg.Key, Fck_MPa = 30, Fy_MPa = 500, RhoVReq_pct = 0.3, RhoHReq_pct = 0.3,
+            BoundaryElementRequired = true, BoundaryElementLength_mm = null,
+            Envelope = new WallVuCombo { Combo = "ULS-7", Vu_kN = 400 },
+            Prov = new Provenance { Source = DesignSource.EtabsDesign, FileSha256 = "sample" }
+        };
+        var w2 = DetailerPipeline.DetailWall(wg, wd2, rules, office);
+        Console.WriteLine("STATUS: " + (w2.State == MemberState.Incomplete ? "INCOMPLETE" : w2.State.ToString()));
+        foreach (var f in w2.Findings) Console.WriteLine("  " + f);
+        ok &= w2.State == MemberState.Incomplete;
+
+        Console.WriteLine();
         Console.WriteLine(ok ? "HARNESS OK" : "HARNESS FAILED");
         return ok ? 0 : 1;
     }

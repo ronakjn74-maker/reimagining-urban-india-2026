@@ -48,5 +48,28 @@ namespace SbcStructural.Detailer
             var state = f.Any(x => x.Status == Status.Failed) ? MemberState.Review : MemberState.Ready;
             return (model, state, f);
         }
+
+        /// <summary>M3: wall-pier detailing. G0, G1/G6, arrangement, shear/min-steel/constructability gates.</summary>
+        public static (WallDetail Detail, MemberState State, IReadOnlyList<Finding> Findings) DetailWall(
+            WallPierGeometry geometry, WallPierDesignRecord design, ColumnRuleSet ruleSet, OfficeSettings settings)
+        {
+            var f = new List<Finding>();
+            f.AddRange(Validation.WallGates.G0(geometry, design));
+            if (f.Any()) return (null, MemberState.Incomplete, f);
+            f.AddRange(Validation.WallGates.G1G6(geometry, design));
+            if (f.Any(x => x.Status == Status.Incomplete)) return (null, MemberState.Incomplete, f);
+
+            var ar = WallArranger.Arrange(geometry, design, ruleSet, settings);
+            if (ar.Error != null) { f.Add(new Finding(Status.Failed, "G5", geometry.Key?.ToString(), ar.Error)); return (null, MemberState.Review, f); }
+            var d = ar.Detail;
+            d.Mark = geometry.Key?.Label ?? geometry.Key?.ToString(); d.StoreyId = geometry.Storey;
+            foreach (var n in ar.Notes) f.Add(new Finding(Status.Warning, "G7", d.Mark, n));
+            f.AddRange(Validation.WallGates.CheckShear(d, design));
+            f.AddRange(Validation.WallGates.G6MinSteel(d));
+            f.AddRange(Validation.WallGates.G7(d));
+            d.Findings = f;
+            var state = f.Any(x => x.Status == Status.Failed) ? MemberState.Review : MemberState.Ready;
+            return (d, state, f);
+        }
     }
 }

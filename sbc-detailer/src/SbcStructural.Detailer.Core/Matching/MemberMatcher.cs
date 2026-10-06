@@ -94,5 +94,28 @@ namespace SbcStructural.Detailer.Matching
         }
 
         static MatchRecord Fail(MatchRecord mr, string why) { mr.Level = MatchLevel.Failed; mr.Confidence = 0; mr.Reason = why; return mr; }
+
+        /// <summary>
+        /// L2 pier-leg match (plan §12): when a wall pier's design record has no single CAD piece whose length
+        /// matches Lw (within tolerance), accept a match against several CAD wall pieces on the same storey whose
+        /// lengths sum to Lw, apportioning the pier's design to each leg by stiffness t*l^3 (Q-B11 default).
+        /// Confidence is lower than an L1/L3 single-leg match. Single-leg piers reuse L1/L3 and are not touched here.
+        /// </summary>
+        public static List<Tuple<CadMemberGeometry, double>> MatchPierLegs(IList<CadMemberGeometry> legsOnStorey, double lwReq, double tw, double tolPct = 5)
+        {
+            // legsOnStorey: candidate CAD wall pieces (same storey, same Tw) ordered along the pier; caller has already
+            // grouped them (e.g. by proximity/colinearity) as the candidate set for one pier mark.
+            double sum = legsOnStorey.Sum(c => ColumnDetailer.Dims(c.Polygon).Item2);
+            if (Math.Abs(sum - lwReq) / lwReq * 100 > tolPct) return null;    // not a match: lengths don't add up
+            double totalStiff = legsOnStorey.Sum(c => tw * Math.Pow(ColumnDetailer.Dims(c.Polygon).Item2, 3));
+            var result = new List<Tuple<CadMemberGeometry, double>>();
+            foreach (var c in legsOnStorey)
+            {
+                double l = ColumnDetailer.Dims(c.Polygon).Item2;
+                double frac = totalStiff > 0 ? (tw * Math.Pow(l, 3)) / totalStiff : 1.0 / legsOnStorey.Count;
+                result.Add(Tuple.Create(c, frac));
+            }
+            return result;
+        }
     }
 }

@@ -102,7 +102,19 @@ namespace SbcStructural.Detailer.Import
  ""LoadCombinations"": { ""match"": ""^Load Combinations"",
    ""fields"": { ""Name"":""Name"", ""Type"":""Type"", ""Case"":""Load Name"", ""SF"":""SF"" },
    ""ignore"": [""Auto"",""Notes"",""Is Auto""],
-   ""required"": [""Name""] } } }");
+   ""required"": [""Name""] },
+ ""PierForces"": { ""match"": ""^Pier Forces"",
+   ""fields"": { ""Story"":""Story"", ""Pier"":""Pier"", ""OutputCase"":""Output Case"", ""Location"":""Location"", ""P"":""P"", ""V2"":""V2"", ""V3"":""V3"", ""M2"":""M2"", ""M3"":""M3"" },
+   ""ignore"": [""Case Type"",""Step Type""],
+   ""required"": [""Story"",""Pier"",""OutputCase"",""V2""] },
+ ""PierSectionProperties"": { ""match"": ""^Pier Section Properties"",
+   ""fields"": { ""Story"":""Story"", ""Pier"":""Pier"", ""Width"":""Width"", ""Thickness"":""Thickness"" },
+   ""ignore"": [],
+   ""required"": [""Story"",""Pier""] },
+ ""PierDesignSummary"": { ""match"": ""^Shear Wall Pier Design Summary"",
+   ""fields"": { ""Story"":""Story"", ""Pier"":""Pier"", ""Location"":""Location"", ""ReqdRebarArea"":""Reqd. Rebar Area"", ""CurrentRebarArea"":""Current Rebar Area"" },
+   ""ignore"": [""DCon"",""Combo""],
+   ""required"": [""Story"",""Pier""] } } }");
         }
     }
 
