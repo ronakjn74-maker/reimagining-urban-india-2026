@@ -1,7 +1,21 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 
-const CFG = window.APP_CONFIG || {};
-const sb = createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
+const CFG = { LOGIN_DOMAIN: 'ledger.local', ...(window.APP_CONFIG || {}) };
+const placeholder = (v) => !v || /YOUR-/.test(v);
+(() => {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('s') && h.get('k')) {
+    try { localStorage.setItem('idl-cfg', JSON.stringify({ url: h.get('s'), key: h.get('k') })); } catch {}
+    history.replaceState(null, '', location.pathname);
+  }
+  if (placeholder(CFG.SUPABASE_URL) || placeholder(CFG.SUPABASE_ANON_KEY)) {
+    try { const c = JSON.parse(localStorage.getItem('idl-cfg') || 'null'); if (c) { CFG.SUPABASE_URL = c.url; CFG.SUPABASE_ANON_KEY = c.key; } } catch {}
+  }
+})();
+const CONFIGURED = !placeholder(CFG.SUPABASE_URL) && !placeholder(CFG.SUPABASE_ANON_KEY);
+const sb = createClient(CONFIGURED ? CFG.SUPABASE_URL : 'https://setup.invalid', CONFIGURED ? CFG.SUPABASE_ANON_KEY : 'setup');
+// Link that carries the connection, so vendors open it once and are set up.
+const shareLink = () => `${location.origin}${location.pathname}#s=${encodeURIComponent(CFG.SUPABASE_URL)}&k=${encodeURIComponent(CFG.SUPABASE_ANON_KEY)}`;
 const APP_URL = location.origin + location.pathname;
 
 const KIND = { transfer: 'Transfer', deposit: 'Deposit', withdrawal: 'Withdrawal', commission: 'Commission' };
@@ -150,8 +164,26 @@ function subscribeLive() {
 }
 
 // ---------- auth ----------
+function renderSetup() {
+  $('#app').innerHTML = `
+    <div class="login"><div class="card">
+      <h1>Connect ID Ledger</h1>
+      <p class="muted small" style="margin:0 0 16px">One-time setup. In Supabase open <b>Project Settings → API</b> and paste the two values.</p>
+      <form id="setup-form">
+        <div class="field"><label>Project URL</label><input name="url" placeholder="https://xxxx.supabase.co" inputmode="url" autocapitalize="none" required></div>
+        <div class="field"><label>anon public key</label><textarea name="key" autocapitalize="none" required></textarea></div>
+        <button class="btn primary block">Connect</button>
+      </form>
+    </div></div>`;
+  $('#setup-form').onsubmit = (e) => {
+    e.preventDefault(); const f = formObj(e.target);
+    location.hash = `s=${encodeURIComponent(f.url.trim().replace(/\/$/, ''))}&k=${encodeURIComponent(f.key.trim())}`;
+    location.reload();
+  };
+}
 function renderLogin(msg = '') {
-  const missing = !CFG.SUPABASE_URL || CFG.SUPABASE_URL.includes('YOUR-PROJECT');
+  if (!CONFIGURED) return renderSetup();
+  const missing = false;
   $('#app').innerHTML = `
     <div class="login">
       <div class="card">
@@ -334,7 +366,7 @@ function viewDashboard(v) {
       ${kpi('Balance in IDs', money(sum(active, (a) => a.current_balance)), `${active.length} active IDs`)}
       ${kpi("Today's P&L", signed(todayPnl), `Settlement day ${fmtD(day)}`)}
       ${kpi('Total P&L', signed(totalPnl), 'All time')}
-      ${kpi('Commission due', money(commDue), `Today so far: ${money(commToday)}`)}
+      ${kpi('Commission earned', money(sum(S.data.settlements, (s) => s.commission)), `To collect ${money(commDue)} · today ${money(commToday)}`)}
       ${kpi('Pending requests', pending.length, pending.length ? 'Waiting for vendors' : 'All clear')}
       ${kpi('Paid to vendors', money(paid), 'Payment ledger')}
       ${kpi('Received from vendors', money(received), 'Payment ledger')}
@@ -853,11 +885,7 @@ function viewCommission(v) {
   v.innerHTML = `
     <div class="section-head"><h2>Commission</h2></div>
     <p class="muted small">Commission = each ID's net loss for the day × that ID's commission % (default 10%). Profit days give no commission. The day runs 11:00 AM → 11:00 AM and settles at 11:00 AM.${admin ? ' Collect it by <b>crediting it into the ID</b> or as a <b>withdrawal</b> (cash / bank / UPI) – the vendor accepts it like any request.' : ''}</p>
-    <div class="kpis section">
-      ${kpi('Due (not received)', money(sum(due, (s) => s.commission)), `${due.length} entries`)}
-      ${kpi('Received', money(sum(sets.filter((s) => s.status === 'received'), (s) => s.commission)), 'All time')}
-      ${admin && !byDate[cur] ? kpi('Running today', money(sum(preview, (c) => c.commission)), fmtD(cur)) : ''}
-    </div>
+    ${commissionSummary(sets)}
     ${admin ? `<div class="card section">
       <h3 style="margin-bottom:8px">Settle a day</h3>
       <div class="row"><input type="date" id="com-date" value="${comDate}" style="flex:1 1 160px;width:auto"><button class="btn primary" id="run-settle">Run settlement</button></div>
@@ -898,6 +926,36 @@ function viewCommission(v) {
       });
     });
   }
+}
+function commissionSummary(sets) {
+  const earned = sum(sets, (s) => s.commission);
+  const recv = sum(sets.filter((s) => s.status === 'received'), (s) => s.commission);
+  const byId = {};
+  sets.forEach((s) => {
+    const r = (byId[s.account_id] ||= { account_id: s.account_id, vendor_id: s.vendor_id, days: new Set(), loss: 0, earned: 0, recv: 0 });
+    r.days.add(s.settle_date); r.earned += Number(s.commission);
+    if (s.status === 'received') r.recv += Number(s.commission);
+  });
+  // loss counted once per ID per day (top-up lines repeat the day's total)
+  const dayLoss = {};
+  sets.forEach((s) => { dayLoss[`${s.account_id}|${s.settle_date}`] = Math.min(dayLoss[`${s.account_id}|${s.settle_date}`] ?? 0, Number(s.net_pnl)); });
+  Object.entries(dayLoss).forEach(([k, v]) => { byId[k.split('|')[0]].loss += v; });
+  const rows = Object.values(byId).sort((a, b) => b.earned - a.earned);
+  return `<div class="section">
+    <div class="section-head"><h2>Commission earned</h2></div>
+    <div class="kpis section">
+      ${kpi('Total earned', money(earned), 'All time')}
+      ${kpi('Received', money(recv), 'Credited or paid')}
+      ${kpi('Still to collect', money(earned - recv), 'Due + requested')}
+      ${kpi('IDs with commission', rows.length)}
+    </div>
+    ${rows.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>ID</th><th class="r">Loss days</th><th class="r">Total loss</th><th class="r">Earned</th><th class="r">To collect</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><td style="white-space:normal"><b>${esc(accName(acc(r.account_id)))}</b>${isAdmin() ? `<div class="muted small">${esc(vendorName(r.vendor_id))}</div>` : ''}</td>
+        <td class="r">${r.days.size}</td><td class="r">${signed(r.loss)}</td><td class="r num"><b>${money(r.earned)}</b></td><td class="r num">${money(r.earned - r.recv)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td>Total</td><td></td><td class="r">${signed(sum(rows, (r) => r.loss))}</td><td class="r num">${money(earned)}</td><td class="r num">${money(earned - recv)}</td></tr></tfoot>
+    </table></div>` : ''}
+  </div>`;
 }
 function commPayoutLabel(s) {
   if (s.status === 'requested') return `Waiting for vendor – request #${s.request_id}`;
@@ -1034,7 +1092,13 @@ function viewVendors(v) {
         <button class="btn">Save</button>
       </form>
       <p class="muted small" style="margin:8px 0 0">Vendors use this number for the “WhatsApp owner” button.</p>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h3 style="margin-bottom:8px">App link (you and vendors)</h3>
+      <p class="muted small" style="margin:0 0 8px">Same link for everyone – the login decides what each person sees. Opening it once connects that phone.</p>
+      <button class="btn block" id="copy-link">Copy app link</button>
     </div>`;
+  $('#copy-link').onclick = () => copy(shareLink(), 'App link copied');
   $('#add-vendor').onclick = () => vendorForm();
   $('#me-form').onsubmit = (e) => {
     e.preventDefault(); const f = formObj(e.target);
@@ -1080,7 +1144,7 @@ function vendorForm(p = null) {
   });
 }
 function credentialsModal(p, pw, title) {
-  const text = `Hi ${p.name}, your login for the ID Ledger app:\n\nLink: ${APP_URL}\nUsername: ${p.username}\nPassword: ${pw}\n\nAdd the IDs you give me there and accept my transfer / deposit / withdrawal requests once done.`;
+  const text = `Hi ${p.name}, your login for the ID Ledger app:\n\nLink: ${shareLink()}\nUsername: ${p.username}\nPassword: ${pw}\n\nAdd the IDs you give me there and accept my transfer / deposit / withdrawal requests once done.`;
   openModal(title, `
     <dl class="kv" style="margin-bottom:14px"><dt>Link</dt><dd>${esc(APP_URL)}</dd><dt>Username</dt><dd class="secret">${esc(p.username)}</dd><dt>Password</dt><dd class="secret">${esc(pw)}</dd></dl>
     <div class="stack">

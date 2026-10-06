@@ -62,18 +62,19 @@ Money you **paid** to vendors or **received** from them: date, mode, UTR or toke
    This works only once. After that, only you can create vendors, from inside the app.
 4. **Authentication → Sign In / Providers → Email**: switch **off** "Allow new users to sign up". Vendors are created only by you.
 
-### 2. Connect the app
-Open **Project Settings → API** and copy the **Project URL** and the **anon public** key into [`config.js`](config.js):
-```js
-SUPABASE_URL: 'https://abcd1234.supabase.co',
-SUPABASE_ANON_KEY: 'eyJhbGciOi...',
-```
-The anon key is designed to be public. Never put the `service_role` key in this app.
+### 2. Put it online and connect it
+1. On GitHub, open this repo → **Settings → Pages**. Under *Build and deployment* choose **Deploy from a branch**, pick branch **`claude/trusting-faraday-o8u6c6`** with folder **`/ (root)`**, then **Save**. After 1–2 minutes the app is live at:
+   **https://ronakjn74-maker.github.io/reimagining-urban-india-2026/id-ledger/**
+2. Open that link. On the **Connect ID Ledger** screen, paste the **Project URL** and the **anon public** key from Supabase → *Project Settings → API*.
+3. Sign in with the owner username and password from step 1.3.
+4. **Vendors → App link → Copy app link** gives the one link for you and all vendors. It already carries the connection, so vendors just open it and log in.
+
+The anon key is designed to be public. Never paste the `service_role` key.
 
 ### 3. (Optional) Automatic settlement at 11:00 AM
 In the SQL Editor, run [`supabase/auto-settlement.sql`](supabase/auto-settlement.sql).
 
-### 4. Put it online (free)
+### 4. Other free hosts (optional)
 **Cloudflare Pages** (works with a private repo):
 1. dash.cloudflare.com → Workers & Pages → Create → Pages → connect this GitHub repo.
 2. Framework: *None*. Build command: *empty*. Output directory: `/`.
