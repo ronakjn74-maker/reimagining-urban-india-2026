@@ -13,3 +13,4 @@
 | 2026-10-06 | SAFE: latest version, not installed yet; foundations phase later. | MASTER_PLAN §18 |
 | 2026-10-06 | Region Mumbai: seismic Zone III (Z=0.16), soil II, I=1.0/1.2, R=5, 5% damping; wind Vb=44 m/s, terrain 3. All settings, to verify against code books. Detailer consequence: ductile (IS 13920) detailing is the default for Mumbai projects. | MASTER_PLAN §18 |
 | 2026-10-06 | Owner does the testing. Do not spend much on automated testing: keep unit tests to the minimum that proves the engine runs and the rules compute; no large suites, no dual-host regression matrices built by agents. Owner test sheets replace them. | Owner message in Detailer session |
+| 2026-10-06 | Use as few credits as possible. Consequence: one developer agent at a time, smaller model for implementation, no multi-agent review panels on code unless the owner asks, tight M1 scope. | Owner message in Detailer session |
