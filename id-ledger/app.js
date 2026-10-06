@@ -4,7 +4,7 @@ const CFG = window.APP_CONFIG || {};
 const sb = createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
 const APP_URL = location.origin + location.pathname;
 
-const KIND = { transfer: 'Transfer', deposit: 'Deposit', withdrawal: 'Withdrawal' };
+const KIND = { transfer: 'Transfer', deposit: 'Deposit', withdrawal: 'Withdrawal', commission: 'Commission' };
 const METHOD = { cash: 'Cash', bank_deposit: 'Bank deposit', bank_transfer: 'Bank transfer', upi: 'UPI' };
 const LEDGER_MODES = ['Cash', 'UPI', 'Bank transfer', 'Bank deposit', 'Other'];
 
@@ -13,7 +13,7 @@ const S = {
   owner: null,
   view: null,
   live: false,
-  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [] },
+  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [], bets: [] },
   f: { idSearch: '', idVendor: '', idStatus: 'active', reqTab: 'pending', reqVendor: '', pnlDate: null, comDate: null, ledVendor: '' },
 };
 const isAdmin = () => S.me?.role === 'admin';
@@ -120,15 +120,16 @@ async function fetchAll(table, order) {
 }
 async function loadData() {
   const admin = isAdmin();
-  const [profiles, accounts, requests, settlements, pnl, ledger] = await Promise.all([
+  const [profiles, accounts, requests, settlements, pnl, ledger, bets] = await Promise.all([
     fetchAll('profiles', 'created_at'),
     fetchAll('accounts', 'created_at'),
     fetchAll('requests', 'created_at'),
     fetchAll('settlements', 'settle_date'),
     admin ? fetchAll('pnl_entries', 'created_at') : [],
     admin ? fetchAll('ledger', 'entry_date') : [],
+    admin ? fetchAll('bets', 'created_at') : [],
   ]);
-  S.data = { profiles, accounts, requests, settlements, pnl, ledger };
+  S.data = { profiles, accounts, requests, settlements, pnl, ledger, bets };
   const me = profiles.find((p) => p.id === S.me.id);
   if (me) S.me = me;
 }
@@ -207,7 +208,7 @@ sb.auth.onAuthStateChange((event, session) => {
 function navItems() {
   const pend = S.data.requests.filter((r) => r.status === 'pending').length;
   return isAdmin()
-    ? [['dashboard', 'Dashboard'], ['ids', 'IDs'], ['requests', 'Requests', pend], ['pnl', 'P&L'], ['commission', 'Commission'], ['ledger', 'Ledger'], ['vendors', 'Vendors']]
+    ? [['dashboard', 'Dashboard'], ['ids', 'IDs'], ['requests', 'Requests', pend], ['pnl', 'Bets & P&L'], ['commission', 'Commission'], ['ledger', 'Ledger'], ['vendors', 'Vendors']]
     : [['ids', 'My IDs'], ['requests', 'Requests', pend], ['commission', 'Commission']];
 }
 function renderShell() {
@@ -266,7 +267,7 @@ function vendorStats(vid) {
     balance: sum(accs.filter((a) => a.status === 'active'), (a) => a.current_balance),
     todayPnl: sum(pnl.filter((p) => p.settle_date === day), (p) => p.amount),
     totalPnl: sum(pnl, (p) => p.amount),
-    commDue: sum(S.data.settlements.filter((s) => s.vendor_id === vid && s.status === 'due'), (s) => s.commission),
+    commDue: sum(S.data.settlements.filter((s) => s.vendor_id === vid && s.status !== 'received'), (s) => s.commission),
     paid: sum(led.filter((l) => l.direction === 'out'), (l) => l.amount),
     received: sum(led.filter((l) => l.direction === 'in'), (l) => l.amount),
     pending: S.data.requests.filter((r) => r.vendor_id === vid && r.status === 'pending'),
@@ -282,15 +283,19 @@ function commissionPreview(day) {
   });
 }
 
+// Withdrawal, or commission paid out by cash / bank / UPI (not credited into an ID)
+const isPayout = (r) => r.kind === 'withdrawal' || (r.kind === 'commission' && !r.to_account);
+
 // ---------- WhatsApp texts ----------
 async function requestMessage(r) {
   const lines = [`*${KIND[r.kind]} request #${r.id}*`];
   if (r.kind === 'transfer') lines.push(`From ID: ${accName(acc(r.from_account))}`, `To ID: ${accName(acc(r.to_account))}`);
   if (r.kind === 'deposit') lines.push(`Deposit into ID: ${accName(acc(r.to_account))}`);
   if (r.kind === 'withdrawal') lines.push(`Withdraw from ID: ${accName(acc(r.from_account))}`);
+  if (r.kind === 'commission') lines.push(r.to_account ? `Credit my commission into ID: ${accName(acc(r.to_account))}` : 'Pay my commission (withdrawal)');
   lines.push(`Amount: ${money(r.amount)}`);
   if (r.method) lines.push(`Method: ${METHOD[r.method]}`);
-  if (r.payee_name || r.payee_phone) lines.push(`${r.kind === 'withdrawal' ? 'Cash to be given to' : 'Person'}: ${[r.payee_name, r.payee_phone].filter(Boolean).join(' – ')}`);
+  if (r.payee_name || r.payee_phone) lines.push(`${isPayout(r) ? 'Cash to be given to' : 'Person'}: ${[r.payee_name, r.payee_phone].filter(Boolean).join(' – ')}`);
   if (r.token_no) lines.push(`Token no: ${r.token_no}`);
   if (r.payee_details) lines.push(`Details: ${r.payee_details}`);
   else if (r.method && r.method !== 'cash') lines.push(`Ask me for the ${METHOD[r.method]} details before doing this.`);
@@ -318,7 +323,7 @@ function viewDashboard(v) {
   const active = S.data.accounts.filter((a) => a.status === 'active');
   const todayPnl = sum(S.data.pnl.filter((p) => p.settle_date === day), (p) => p.amount);
   const totalPnl = sum(S.data.pnl, (p) => p.amount);
-  const commDue = sum(S.data.settlements.filter((s) => s.status === 'due'), (s) => s.commission);
+  const commDue = sum(S.data.settlements.filter((s) => s.status !== 'received'), (s) => s.commission);
   const commToday = sum(commissionPreview(day), (c) => c.commission);
   const paid = sum(S.data.ledger.filter((l) => l.direction === 'out'), (l) => l.amount);
   const received = sum(S.data.ledger.filter((l) => l.direction === 'in'), (l) => l.amount);
@@ -414,7 +419,7 @@ function drawIdList() {
       <div class="row">
         <button class="btn sm" data-act="statement">Statement</button>
         <button class="btn sm" data-act="edit">Edit</button>
-        ${isAdmin() ? `<button class="btn sm" data-act="pnl">+ P&L</button><button class="btn sm" data-act="req">Request</button>` : ''}
+        ${isAdmin() ? `<button class="btn sm" data-act="bet">+ Bet</button><button class="btn sm" data-act="req">Request</button>` : ''}
       </div>
     </div>`;
   }).join('') : `<div class="empty" style="grid-column:1/-1">No IDs here yet.</div>`;
@@ -429,7 +434,7 @@ function onIdListClick(e) {
   if (act === 'show-pw') { const s = card.querySelector('[data-pw]'); s.textContent = s.textContent.startsWith('•') ? (a.password || '—') : '••••••'; }
   if (act === 'edit') idForm(a);
   if (act === 'statement') statement(a);
-  if (act === 'pnl') pnlQuick(a);
+  if (act === 'bet') betForm({ account_id: a.id });
   if (act === 'req') requestForm({ vendor: a.vendor_id, from: a.id });
 }
 
@@ -447,7 +452,7 @@ function idForm(a = null) {
         <div class="field"><label>Password</label><input name="password" value="${esc(a?.password)}" autocapitalize="none"></div>
         ${!a || admin ? `<div class="field"><label>Start balance (deposit) ₹</label><input name="opening_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a?.opening_balance ?? '')}" required></div>` : ''}
         ${a && admin ? `<div class="field"><label>Current balance ₹ (correction)</label><input name="current_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a.current_balance)}"></div>` : ''}
-        <div class="field"><label>Commission % on daily loss</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? '')}" required></div>
+        <div class="field"><label>Commission % on daily loss</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? 10)}" required></div>
         ${a ? `<div class="field"><label>Status</label><select name="status"><option value="active">Active</option><option value="closed" ${a.status === 'closed' ? 'selected' : ''}>Closed</option></select></div>` : ''}
       </div>
       <div class="field"><label>Notes</label><textarea name="notes">${esc(a?.notes)}</textarea></div>
@@ -538,9 +543,10 @@ function requestCard(r) {
     <dl class="kv" style="margin-top:8px">
       ${admin ? `<dt>Vendor</dt><dd>${esc(vendorName(r.vendor_id))}</dd>` : ''}
       ${r.from_account ? `<dt>From ID</dt><dd>${esc(accName(acc(r.from_account)))}${r.from_balance_after != null ? ` <span class="muted small">→ ${money(r.from_balance_after)}</span>` : ''}</dd>` : ''}
-      ${r.to_account ? `<dt>To ID</dt><dd>${esc(accName(acc(r.to_account)))}${r.to_balance_after != null ? ` <span class="muted small">→ ${money(r.to_balance_after)}</span>` : ''}</dd>` : ''}
+      ${r.kind === 'commission' && !r.to_account ? `<dt>Pay as</dt><dd>Withdrawal (not from an ID)</dd>` : ''}
+      ${r.to_account ? `<dt>${r.kind === 'commission' ? 'Credit to ID' : 'To ID'}</dt><dd>${esc(accName(acc(r.to_account)))}${r.to_balance_after != null ? ` <span class="muted small">→ ${money(r.to_balance_after)}</span>` : ''}</dd>` : ''}
       ${r.method ? `<dt>Method</dt><dd>${METHOD[r.method]}</dd>` : ''}
-      ${r.payee_name || r.payee_phone ? `<dt>${r.kind === 'withdrawal' ? 'Cash to' : 'Person'}</dt><dd>${esc(r.payee_name)} ${r.payee_phone ? `<a href="tel:${esc(r.payee_phone)}">${esc(r.payee_phone)}</a>` : ''}</dd>` : ''}
+      ${r.payee_name || r.payee_phone ? `<dt>${isPayout(r) ? 'Cash to' : 'Person'}</dt><dd>${esc(r.payee_name)} ${r.payee_phone ? `<a href="tel:${esc(r.payee_phone)}">${esc(r.payee_phone)}</a>` : ''}</dd>` : ''}
       ${r.token_no ? `<dt>Token</dt><dd><b>${esc(r.token_no)}</b></dd>` : ''}
       ${r.payee_details ? `<dt>Details</dt><dd style="white-space:pre-line">${esc(r.payee_details)}</dd>` : ''}
       ${needsDetails ? `<dt>Details</dt><dd class="neg">${admin ? 'Not given – vendor will ask you' : 'Ask the owner for details'}</dd>` : ''}
@@ -576,8 +582,10 @@ function bindRequestCards(root) {
 function respondForm(r, accept) {
   openModal(`${accept ? 'Complete' : 'Reject'} request #${r.id}`, `
     <form id="resp-form">
-      <p>${KIND[r.kind]} of <b>${money(r.amount)}</b>${r.kind === 'transfer' ? ` from ${esc(accName(acc(r.from_account)))} to ${esc(accName(acc(r.to_account)))}` : ` ${r.kind === 'deposit' ? 'into' : 'from'} ${esc(accName(acc(r.from_account || r.to_account)))}`}.</p>
-      ${accept ? `<p class="muted small">The ID balance${r.kind === 'transfer' ? 's' : ''} will update immediately.</p>
+      <p>${KIND[r.kind]} of <b>${money(r.amount)}</b>${r.kind === 'transfer' ? ` from ${esc(accName(acc(r.from_account)))} to ${esc(accName(acc(r.to_account)))}`
+        : r.kind === 'commission' && !r.to_account ? ' paid out (cash / bank / UPI)'
+        : ` ${r.kind === 'withdrawal' ? 'from' : 'into'} ${esc(accName(acc(r.from_account || r.to_account)))}`}.</p>
+      ${accept ? `<p class="muted small">${r.from_account || r.to_account ? `The ID balance${r.kind === 'transfer' ? 's' : ''} will update immediately.` : 'No ID balance changes.'}</p>
         <div class="field"><label>Proof photo / screenshot (optional)</label><input type="file" name="proof" accept="image/*"></div>` : ''}
       <div class="field"><label>Note (optional)</label><input name="note" placeholder="${accept ? 'e.g. done, UTR no.' : 'Reason'}"></div>
       <button class="btn ${accept ? 'good' : 'danger'} block" type="submit">${accept ? 'Confirm – done' : 'Reject request'}</button>
@@ -598,6 +606,15 @@ function accountOptions(vendorId, selected) {
   const list = S.data.accounts.filter((a) => a.status === 'active' && (!vendorId || a.vendor_id === vendorId));
   return `<option value="">Choose ID…</option>` + list.map((a) =>
     `<option value="${a.id}" ${a.id === selected ? 'selected' : ''}>${esc(accName(a))} · ${money(a.current_balance)}${vendorId ? '' : ` (${esc(vendorName(a.vendor_id))})`}</option>`).join('');
+}
+async function afterRequestCreated(id, sendWa = true) {
+  await loadData(); renderView();
+  const r = S.data.requests.find((x) => x.id === id);
+  if (!sendWa || !r) return;
+  const phone = prof(r.vendor_id)?.phone;
+  if (!phone) return toast('Vendor has no phone number – add it in Vendors', 'error');
+  const text = await requestMessage(r);
+  openModal('Send on WhatsApp', `<p>Request #${id} is ready to send to ${esc(vendorName(r.vendor_id))}.</p><a class="btn wa block" href="${esc(waUrl(phone, text))}" target="_blank" rel="noopener">Open WhatsApp</a>`);
 }
 function requestForm(pre = {}) {
   if (!vendors().length) return toast('Create a vendor first', 'error');
@@ -658,13 +675,7 @@ function requestForm(pre = {}) {
           p_amount: Number(f.amount), p_note: f.note || null, p_extra: extra,
         }));
         modal.close(); toast(`Request #${id} created`);
-        await loadData(); renderView();
-        const r = S.data.requests.find((x) => x.id === id);
-        const phone = prof(f.vendor)?.phone;
-        if (f.send_wa && r) {
-          if (!phone) toast('Vendor has no phone number – add it in Vendors', 'error');
-          else { const text = await requestMessage(r); openModal('Send on WhatsApp', `<p>Request #${id} is ready to send to ${esc(vendorName(f.vendor))}.</p><a class="btn wa block" href="${esc(waUrl(phone, text))}" target="_blank" rel="noopener">Open WhatsApp</a>`); }
-        }
+        await afterRequestCreated(id, f.send_wa);
       });
     };
   });
@@ -683,7 +694,7 @@ function viewPnl(v) {
   const total = sum(dayEntries, (p) => p.amount);
   const comm = sum(commissionPreview(day), (c) => c.commission);
   v.innerHTML = `
-    <div class="section-head"><h2>Profit & loss</h2></div>
+    <div class="section-head"><h2>Bets & P&L</h2><button class="btn primary" id="new-bet">+ New bet</button></div>
     <div class="toolbar">
       <div><label for="pnl-date">Settlement day (11 AM → 11 AM)</label><input type="date" id="pnl-date" value="${day}"></div>
     </div>
@@ -691,7 +702,9 @@ function viewPnl(v) {
       ${kpi('Day P&L', signed(total), fmtD(day))}
       ${kpi('Commission on losses', money(comm), day === settleDay() ? 'Running – settles at 11 AM' : '')}
     </div>
-    <p class="muted small">Type a number for each ID: <b>positive = profit</b>, <b>negative = loss</b> (e.g. −2000). Saving adds it to that day and updates the ID balance. You can add more than once a day.</p>
+    ${betsSection(day)}
+    <div class="section-head" style="margin-top:20px"><h2>Quick P&L</h2></div>
+    <p class="muted small">No bet details? Type a number for each ID: <b>positive = profit</b>, <b>negative = loss</b> (e.g. −2000). Saving adds it to that day and updates the ID balance. You can add more than once a day.</p>
     ${ids.length ? `<form id="pnl-form"><div class="table-wrap"><table>
       <thead><tr><th>ID</th><th class="r">Day so far</th><th class="r">Add ±</th></tr></thead>
       <tbody>${ids.map((a) => `<tr><td style="white-space:normal"><b>${esc(accName(a))}</b><div class="muted small">${esc(vendorName(a.vendor_id))} · ${money(a.current_balance)}</div></td>
@@ -703,9 +716,11 @@ function viewPnl(v) {
       <div class="section-head"><h2>Entries on ${fmtD(day)}</h2></div>
       <div class="list">${dayEntries.length ? dayEntries.map((p) => `<div class="item row between">
         <div><b>${esc(accName(acc(p.account_id)))}</b> <span class="muted small">${esc(vendorName(acc(p.account_id)?.vendor_id))} · ${fmtDT(p.created_at)}${p.note ? ` · ${esc(p.note)}` : ''}</span></div>
-        <div class="row">${signed(Number(p.amount))}<button class="icon-btn" data-del-pnl="${p.id}" title="Delete">🗑</button></div></div>`).join('') : '<div class="empty">No entries for this day</div>'}</div>
+        <div class="row">${signed(Number(p.amount))}${p.bet_id ? '<span class="pill kind">bet</span>' : `<button class="icon-btn" data-del-pnl="${p.id}" title="Delete">🗑</button>`}</div></div>`).join('') : '<div class="empty">No entries for this day</div>'}</div>
     </div>`;
   $('#pnl-date').onchange = (e) => { S.f.pnlDate = e.target.value || null; renderView(); };
+  $('#new-bet').onclick = () => betForm({ settle_date: day });
+  bindBets(v);
   $('#pnl-form')?.addEventListener('submit', (e) => {
     e.preventDefault();
     const f = formObj(e.target);
@@ -725,25 +740,99 @@ function viewPnl(v) {
     busy(b, async () => { must(await sb.from('pnl_entries').delete().eq('id', b.dataset.delPnl)); toast('Deleted'); scheduleReload(); });
   });
 }
-function pnlQuick(a) {
-  const day = settleDay();
-  openModal(`P&L · ${accName(a)}`, `
-    <form id="pq">
-      <div class="field"><div class="seg"><label><input type="radio" name="t" value="1" checked><span>Profit</span></label><label><input type="radio" name="t" value="-1"><span>Loss</span></label></div></div>
+// Back: won = stake × (odds − 1), lost = −stake.  Lay: won = +stake, lost = −stake × (odds − 1).
+function betPnl(side, stake, odds, result) {
+  stake = Number(stake) || 0; odds = Number(odds) || 0;
+  const r2 = (n) => Math.round(n * 100) / 100;
+  if (result === 'won') return side === 'lay' ? stake : r2(stake * (odds - 1));
+  if (result === 'lost') return side === 'lay' ? -r2(stake * (odds - 1)) : -stake;
+  return 0;
+}
+const betLabel = (b) => [b.event, b.market, b.selection].filter(Boolean).join(' · ') || 'Bet';
+function betItem(b) {
+  return `<div class="item" data-bet="${b.id}">
+    <div class="row between">
+      <div><b>${esc(betLabel(b))}</b><div class="muted small">${esc(accName(acc(b.account_id)))} · ${esc(vendorName(acc(b.account_id)?.vendor_id))} · ${fmtD(b.settle_date)}</div></div>
+      <span class="pill ${b.result === 'open' ? 'pending' : b.result === 'won' ? 'completed' : b.result === 'lost' ? 'rejected' : ''}">${b.result}</span>
+    </div>
+    <div class="row between" style="margin-top:6px">
+      <span class="small"><span class="pill kind">${b.side.toUpperCase()}</span> ${money(b.stake)} @ <b>${Number(b.odds)}</b></span>
+      ${b.result === 'open' ? `<span class="muted small">win ${signed(betPnl(b.side, b.stake, b.odds, 'won'))} / lose ${signed(betPnl(b.side, b.stake, b.odds, 'lost'))}</span>` : signed(Number(b.pnl))}
+    </div>
+    <div class="actions">
+      ${b.result === 'open' ? `<button class="btn sm good" data-bact="won">Won</button><button class="btn sm danger" data-bact="lost">Lost</button><button class="btn sm" data-bact="void">Void</button>` : ''}
+      <button class="btn sm" data-bact="edit">Edit</button>
+    </div>
+  </div>`;
+}
+function betsSection(day) {
+  const open = S.data.bets.filter((b) => b.result === 'open');
+  const settled = S.data.bets.filter((b) => b.result !== 'open' && b.settle_date === day);
+  return `<div class="section"><div class="section-head"><h2>Open bets (${open.length})</h2></div>
+      <div class="list">${open.length ? open.map(betItem).join('') : '<div class="empty">No open bets</div>'}</div></div>
+    <div class="section"><div class="section-head"><h2>Settled bets on ${fmtD(day)}</h2><span class="muted small">${signed(sum(settled, (b) => b.pnl))}</span></div>
+      <div class="list">${settled.length ? settled.map(betItem).join('') : '<div class="empty">No settled bets this day</div>'}</div></div>`;
+}
+function bindBets(root) {
+  root.querySelectorAll('[data-bact]').forEach((btn) => btn.onclick = () => {
+    const b = S.data.bets.find((x) => x.id === Number(btn.closest('[data-bet]').dataset.bet)); if (!b) return;
+    if (btn.dataset.bact === 'edit') return betForm(b);
+    busy(btn, async () => {
+      must(await sb.from('bets').update({ result: btn.dataset.bact }).eq('id', b.id));
+      const p = betPnl(b.side, b.stake, b.odds, btn.dataset.bact);
+      toast(`Bet ${btn.dataset.bact}: ${p > 0 ? '+' : ''}${money(p)}`); scheduleReload();
+    });
+  });
+}
+function betForm(b = {}) {
+  const ids = S.data.accounts.filter((a) => a.status === 'active' || a.id === b.account_id);
+  if (!ids.length) return toast('Add an ID first', 'error');
+  const seg = (name, opts, cur) => `<div class="seg">${opts.map(([k, l]) => `<label><input type="radio" name="${name}" value="${k}" ${k === cur ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div>`;
+  openModal(b.id ? `Edit bet #${b.id}` : 'New bet', `
+    <form id="bet-form">
+      <div class="field"><label>ID</label><select name="account_id" required>${ids.map((a) => `<option value="${a.id}" ${a.id === b.account_id ? 'selected' : ''}>${esc(accName(a))} (${esc(vendorName(a.vendor_id))})</option>`).join('')}</select></div>
       <div class="fields two">
-        <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
-        <div class="field"><label>Settlement day</label><input name="day" type="date" value="${day}" required></div>
+        <div class="field"><label>Event / match</label><input name="event" value="${esc(b.event)}" placeholder="e.g. IND v AUS"></div>
+        <div class="field"><label>Market</label><input name="market" value="${esc(b.market)}" placeholder="e.g. Match odds"></div>
       </div>
-      <div class="field"><label>Note</label><input name="note"></div>
-      <button class="btn primary block">Save</button>
+      <div class="field"><label>Selection</label><input name="selection" value="${esc(b.selection)}" placeholder="e.g. India"></div>
+      <div class="field"><label>Type</label>${seg('side', [['back', 'Back (for)'], ['lay', 'Lay (against)']], b.side || 'back')}</div>
+      <div class="fields two">
+        <div class="field"><label>Stake ₹</label><input name="stake" type="number" step="0.01" min="0.01" inputmode="decimal" value="${esc(b.stake ?? '')}" required></div>
+        <div class="field"><label>Odds (decimal)</label><input name="odds" type="number" step="0.001" min="1.001" inputmode="decimal" value="${esc(b.odds ?? '')}" placeholder="e.g. 1.90" required></div>
+      </div>
+      <div class="field"><label>Result</label>${seg('result', [['open', 'Open'], ['won', 'Won'], ['lost', 'Lost'], ['void', 'Void']], b.result || 'open')}</div>
+      <div class="card small" id="bet-preview" style="margin-bottom:12px"></div>
+      <div class="fields two">
+        <div class="field"><label>Settlement day</label><input name="settle_date" type="date" value="${esc(b.settle_date || settleDay())}" required></div>
+        <div class="field"><label>Note</label><input name="note" value="${esc(b.note)}"></div>
+      </div>
+      <button class="btn primary block" type="submit">${b.id ? 'Save' : 'Add bet'}</button>
+      ${b.id ? '<button class="btn danger block" type="button" id="del-bet" style="margin-top:8px">Delete bet</button>' : ''}
     </form>`, (root) => {
-    $('#pq', root).onsubmit = (e) => {
-      e.preventDefault(); const f = formObj(e.target);
+    const form = $('#bet-form', root);
+    const preview = () => {
+      const f = formObj(form);
+      const w = betPnl(f.side, f.stake, f.odds, 'won'); const l = betPnl(f.side, f.stake, f.odds, 'lost');
+      $('#bet-preview', root).innerHTML = f.result === 'open'
+        ? `If it wins: ${signed(w)} &nbsp;·&nbsp; If it loses: ${signed(l)}<br><span class="muted">Balance changes only when you set the result.</span>`
+        : `P&L for this bet: ${signed(betPnl(f.side, f.stake, f.odds, f.result))}`;
+    };
+    form.addEventListener('input', preview); form.addEventListener('change', preview); preview();
+    form.onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(form);
+      const row = { account_id: f.account_id, event: f.event.trim() || null, market: f.market.trim() || null, selection: f.selection.trim() || null,
+        side: f.side, stake: Number(f.stake), odds: Number(f.odds), result: f.result, settle_date: f.settle_date, note: f.note.trim() || null };
       busy(e.submitter, async () => {
-        must(await sb.from('pnl_entries').insert({ account_id: a.id, settle_date: f.day, amount: Number(f.amount) * Number(f.t), note: f.note || null }));
-        modal.close(); toast('P&L saved'); scheduleReload();
+        if (b.id) must(await sb.from('bets').update(row).eq('id', b.id));
+        else must(await sb.from('bets').insert(row));
+        modal.close(); toast(b.id ? 'Bet saved' : 'Bet added'); scheduleReload();
       });
     };
+    $('#del-bet', root)?.addEventListener('click', (e) => {
+      if (!confirm('Delete this bet? Its P&L will be reversed.')) return;
+      busy(e.target, async () => { must(await sb.from('bets').delete().eq('id', b.id)); modal.close(); toast('Bet deleted'); scheduleReload(); });
+    });
   });
 }
 
@@ -754,20 +843,20 @@ function viewCommission(v) {
   const admin = isAdmin();
   const cur = settleDay();
   const sets = S.data.settlements;
-  const due = sets.filter((s) => s.status === 'due');
+  const due = sets.filter((s) => s.status !== 'received');
   const byDate = {};
   sets.forEach((s) => (byDate[s.settle_date] ||= []).push(s));
   const dates = Object.keys(byDate).sort().reverse();
-  const preview = admin ? commissionPreview(cur).filter((c) => c.commission > 0) : [];
+  const preview = admin && !byDate[cur] ? commissionPreview(cur).filter((c) => c.commission > 0) : [];
   const comDate = S.f.comDate || addDays(cur, -1);
 
   v.innerHTML = `
     <div class="section-head"><h2>Commission</h2></div>
-    <p class="muted small">Commission = loss of the day × the ID's commission %. The day runs 11:00 AM → 11:00 AM and settles at 11:00 AM.</p>
+    <p class="muted small">Commission = each ID's net loss for the day × that ID's commission % (default 10%). Profit days give no commission. The day runs 11:00 AM → 11:00 AM and settles at 11:00 AM.${admin ? ' Collect it by <b>crediting it into the ID</b> or as a <b>withdrawal</b> (cash / bank / UPI) – the vendor accepts it like any request.' : ''}</p>
     <div class="kpis section">
       ${kpi('Due (not received)', money(sum(due, (s) => s.commission)), `${due.length} entries`)}
       ${kpi('Received', money(sum(sets.filter((s) => s.status === 'received'), (s) => s.commission)), 'All time')}
-      ${admin ? kpi('Running today', money(sum(preview, (c) => c.commission)), fmtD(cur)) : ''}
+      ${admin && !byDate[cur] ? kpi('Running today', money(sum(preview, (c) => c.commission)), fmtD(cur)) : ''}
     </div>
     ${admin ? `<div class="card section">
       <h3 style="margin-bottom:8px">Settle a day</h3>
@@ -776,7 +865,8 @@ function viewCommission(v) {
     </div>
     ${preview.length ? `<div class="section"><div class="section-head"><h2>Running today (${fmtD(cur)})</h2></div>${commTable(preview.map((c) => ({ ...c, net_pnl: c.net, commission_pct: c.pct, status: 'running' })), false)}</div>` : ''}` : ''}
     ${dates.length ? dates.map((d) => `<div class="section"><div class="section-head"><h2>${fmtD(d)}</h2>
-        <span class="muted small">Total ${money(sum(byDate[d], (s) => s.commission))}</span></div>${commTable(byDate[d], admin)}</div>`).join('')
+        <span class="muted small">Total ${money(sum(byDate[d], (s) => s.commission))}</span>
+        ${admin && byDate[d].some((s) => s.status === 'due') ? `<button class="btn sm" data-credit-all="${d}">Credit all due to IDs</button>` : ''}</div>${commTable(byDate[d], admin)}</div>`).join('')
       : '<div class="empty">No settled commission yet</div>'}`;
   if (admin) {
     $('#com-date').onchange = (e) => { S.f.comDate = e.target.value; };
@@ -785,20 +875,87 @@ function viewCommission(v) {
       const n = must(await sb.rpc('run_settlement', { p_date: d }));
       toast(`Settled ${fmtD(d)}: ${n} ID${n === 1 ? '' : 's'} with commission`); scheduleReload();
     });
-    v.querySelectorAll('[data-recv]').forEach((b) => b.onclick = () => busy(b, async () => {
-      const recv = b.dataset.to === 'received';
-      must(await sb.from('settlements').update({ status: recv ? 'received' : 'due', received_at: recv ? new Date().toISOString() : null }).eq('id', b.dataset.recv));
-      scheduleReload();
-    }));
+    v.querySelectorAll('[data-cact]').forEach((b) => b.onclick = () => {
+      const st = S.data.settlements.find((x) => x.id === Number(b.dataset.sid)); if (!st) return;
+      const act = b.dataset.cact;
+      if (act === 'credit') busy(b, async () => {
+        const id = must(await sb.rpc('request_commission', { p_settlement: st.id, p_mode: 'id' }));
+        toast(`Request #${id} sent to vendor`); await afterRequestCreated(id);
+      });
+      if (act === 'withdraw') commissionWithdrawForm(st);
+      if (act === 'manual' || act === 'undo') busy(b, async () => {
+        const recv = act === 'manual';
+        must(await sb.from('settlements').update({ status: recv ? 'received' : 'due', payout: recv ? 'other' : null, received_at: recv ? new Date().toISOString() : null }).eq('id', st.id));
+        scheduleReload();
+      });
+    });
+    v.querySelectorAll('[data-credit-all]').forEach((b) => b.onclick = () => {
+      const rows = S.data.settlements.filter((x) => x.settle_date === b.dataset.creditAll && x.status === 'due' && x.commission > 0);
+      if (!confirm(`Send ${rows.length} request(s) to credit ${money(sum(rows, (x) => x.commission))} commission into the IDs?`)) return;
+      busy(b, async () => {
+        for (const st of rows) must(await sb.rpc('request_commission', { p_settlement: st.id, p_mode: 'id' }));
+        toast(`${rows.length} request(s) sent – remind vendors from the Dashboard`); scheduleReload();
+      });
+    });
   }
 }
+function commPayoutLabel(s) {
+  if (s.status === 'requested') return `Waiting for vendor – request #${s.request_id}`;
+  if (s.status !== 'received') return '';
+  return { id: 'Received – credited into the ID', withdrawal: 'Received – paid as withdrawal', other: 'Received – marked manually' }[s.payout] || 'Received';
+}
+function commissionWithdrawForm(st) {
+  openModal(`Withdraw commission · ${money(st.commission)}`, `
+    <form id="cw-form">
+      <p class="small">${esc(accName(acc(st.account_id)))} · ${esc(vendorName(st.vendor_id))} · ${fmtD(st.settle_date)}. The ID balance does not change.</p>
+      <div class="field"><label>Method</label><select name="method">${Object.entries(METHOD).map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select></div>
+      <div data-cash>
+        <div class="fields two">
+          <div class="field"><label>Cash to be given to (name)</label><input name="payee_name"></div>
+          <div class="field"><label>Person phone</label><input name="payee_phone" type="tel" inputmode="tel"></div>
+        </div>
+        <div class="field"><label>Token number</label><input name="token_no"></div>
+        <div class="field"><label>Token / slip photo</label><input name="photo" type="file" accept="image/*"></div>
+      </div>
+      <div class="field hidden" data-bank><label>Bank / UPI details</label><textarea name="payee_details" placeholder="Leave empty if the vendor should ask you."></textarea></div>
+      <div class="field"><label>Note</label><input name="note"></div>
+      <button class="btn primary block">Send withdrawal request</button>
+    </form>`, (root) => {
+    const form = $('#cw-form', root);
+    const sync = () => { const cash = form.elements.method.value === 'cash'; $('[data-cash]', root).classList.toggle('hidden', !cash); $('[data-bank]', root).classList.toggle('hidden', cash); };
+    form.elements.method.onchange = sync; sync();
+    form.onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(form); const cash = f.method === 'cash';
+      busy(e.submitter, async () => {
+        const extra = { method: f.method, ...(cash ? { payee_name: f.payee_name, payee_phone: f.payee_phone, token_no: f.token_no } : { payee_details: f.payee_details }) };
+        if (cash) extra.photo_path = await uploadPhoto(form.elements.photo.files[0], st.vendor_id);
+        const id = must(await sb.rpc('request_commission', { p_settlement: st.id, p_mode: 'withdrawal', p_note: f.note || null, p_extra: extra }));
+        modal.close(); toast(`Request #${id} created`); await afterRequestCreated(id);
+      });
+    };
+  });
+}
 function commTable(rows, actions) {
-  return `<div class="table-wrap"><table><thead><tr><th>ID</th>${isAdmin() ? '<th>Vendor</th>' : ''}<th class="r">Day loss</th><th class="r">%</th><th class="r">Commission</th><th>Status</th>${actions ? '<th></th>' : ''}</tr></thead><tbody>
-    ${rows.map((s) => `<tr><td>${esc(accName(acc(s.account_id)))}</td>${isAdmin() ? `<td>${esc(vendorName(s.vendor_id))}</td>` : ''}
-      <td class="r">${signed(Number(s.net_pnl))}</td><td class="r">${Number(s.commission_pct)}%</td><td class="r num"><b>${money(s.commission)}</b></td>
-      <td><span class="pill ${s.status}">${s.status}</span></td>
-      ${actions ? `<td>${s.status === 'due' ? `<button class="btn sm" data-recv="${s.id}" data-to="received">Mark received</button>` : `<button class="btn sm" data-recv="${s.id}" data-to="due">Undo</button>`}</td>` : ''}</tr>`).join('')}
-  </tbody></table></div>`;
+  return `<div class="list">${rows.map((s) => {
+    const full = Math.round(-Number(s.net_pnl) * Number(s.commission_pct)) / 100;
+    const topUp = Number(s.net_pnl) < 0 && Number(s.commission) < full - 0.005;
+    return `<div class="item">
+      <div class="row between">
+        <div><b>${esc(accName(acc(s.account_id)))}</b>${isAdmin() ? `<div class="muted small">${esc(vendorName(s.vendor_id))}</div>` : ''}</div>
+        <span class="pill ${s.status === 'requested' || s.status === 'running' ? 'pending' : s.status}">${s.status}</span>
+      </div>
+      <div class="row between" style="margin-top:6px">
+        <span class="small">Day loss ${signed(Number(s.net_pnl))} × ${Number(s.commission_pct)}%</span>
+        <span class="big" style="font-size:1.1rem">${money(s.commission)}</span>
+      </div>
+      ${topUp ? `<div class="muted small">Top-up – total for the day ${money(full)}, the rest was already collected</div>` : ''}
+      ${commPayoutLabel(s) ? `<div class="muted small">${commPayoutLabel(s)}</div>` : ''}
+      ${actions && s.status === 'due' ? `<div class="actions">
+          <button class="btn sm good" data-cact="credit" data-sid="${s.id}">Credit to ID</button>
+          <button class="btn sm" data-cact="withdraw" data-sid="${s.id}">Withdraw</button>
+          <button class="btn sm" data-cact="manual" data-sid="${s.id}" title="Already paid some other way">Mark received</button></div>`
+        : actions && s.status === 'received' && (!s.payout || s.payout === 'other') ? `<div class="actions"><button class="btn sm" data-cact="undo" data-sid="${s.id}">Undo</button></div>` : ''}
+    </div>`; }).join('')}</div>`;
 }
 
 // ============================================================

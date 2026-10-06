@@ -8,7 +8,7 @@ Everything runs on free tiers: **Supabase** (database, login, live updates, phot
 
 | | Owner (you) | Vendor |
 |---|---|---|
-| Dashboard, totals, P&L, payment ledger | ✅ | ❌ never visible |
+| Dashboard, totals, bets, P&L, payment ledger | ✅ | ❌ never visible |
 | Create vendors, reset passwords, switch vendors off | ✅ | ❌ |
 | Add an ID (username, password, login link, start balance, commission %) | ✅ any vendor | ✅ own IDs only |
 | Edit an ID's login details and commission % | ✅ | ✅ own IDs only |
@@ -16,6 +16,7 @@ Everything runs on free tiers: **Supabase** (database, login, live updates, phot
 | Create transfer, deposit or withdrawal requests | ✅ | ❌ |
 | Accept or reject a request (balances update instantly) | ✅ (mark done) | ✅ own requests |
 | See commission statement | ✅ | ✅ own IDs |
+| Accept commission requests (credit to ID or pay out) | — | ✅ |
 | WhatsApp | Send requests and reminders to vendors | "WhatsApp owner" to ask you for bank or UPI details |
 
 These rules are enforced **inside the database** (row-level security), not just hidden in the page. A vendor can't read your dashboard data even with technical tricks.
@@ -28,11 +29,21 @@ These rules are enforced **inside the database** (row-level security), not just 
 - After you create a request, a ready-made WhatsApp message opens for the vendor. It includes a link to the photo, valid for 7 days.
 - The vendor presses **Accept**, optionally attaching a proof photo or note. Both IDs' balances update and everyone's screen refreshes live.
 
-### P&L and commission
-- **P&L tab**: a daily sheet. Type `+5000` for profit or `-2000` for loss next to each ID and press Save. The ID's balance changes with it.
+### Bets, P&L and commission (owner only)
+- **Bets & P&L tab → + New bet** (or **+ Bet** on an ID card): event, market, selection, **Back** or **Lay**, stake, decimal odds.
+  - While a bet is **Open**, the ID balance doesn't change. Press **Won**, **Lost** or **Void** and the P&L goes onto the ID straight away.
+  - **Back**: won = stake × (odds − 1), lost = − stake. Example: ₹1,000 @ 1.90 → +₹900 / −₹1,000.
+  - **Lay**: won (the selection lost) = + stake, lost = − stake × (odds − 1). Example: ₹500 @ 4.00 → +₹500 / −₹1,500.
+  - **Void** = 0. If you change a result or delete a bet later, the balance corrects itself.
+- **Quick P&L**: no bet details? Type `+5000` or `-2000` next to each ID and press Save.
 - A **settlement day** runs from 11:00 AM to 11:00 AM IST.
-- **Commission** = the ID's net *loss* for the day × that ID's commission %.
-- Settle a day from the **Commission** tab, or switch on automatic settlement at 11:00 AM (step 3 below). Then mark each line *received*.
+- **Commission** = each ID's **net loss for the day** × that ID's commission %. The default is **10%** and can be changed per ID. A profit day gives no commission.
+  - Example: bets of +900, −2,000 and −1,500 give a −2,600 day, so 10% = ₹260.
+- Settle a day from the **Commission** tab, or automatically at 11:00 AM (step 3 below). Then collect each line in one of three ways:
+  - **Credit to ID**: the vendor accepts, and the commission is added to that ID's balance. **Credit all due to IDs** does a whole day in one tap.
+  - **Withdraw**: the vendor pays it out like a withdrawal (cash with person, token and photo, or bank/UPI). The ID balance doesn't change.
+  - **Mark received**: for commission already paid some other way.
+- If more losses are entered for a day that was already collected, running settlement again adds a **top-up line for only the difference**.
 
 ### Payment ledger
 Money you **paid** to vendors or **received** from them: date, mode, UTR or token, note. The dashboard shows totals per vendor.

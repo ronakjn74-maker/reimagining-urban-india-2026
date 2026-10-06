@@ -48,7 +48,7 @@ create table public.accounts (
   password         text,
   opening_balance  numeric(14,2) not null default 0,
   current_balance  numeric(14,2) not null default 0,
-  commission_pct   numeric(5,2)  not null default 0 check (commission_pct between 0 and 100),
+  commission_pct   numeric(5,2)  not null default 10 check (commission_pct between 0 and 100),
   status           text not null default 'active' check (status in ('active','closed')),
   notes            text,
   created_by       uuid,
@@ -95,7 +95,8 @@ create trigger accounts_guard before insert or update on public.accounts
 -- ---------------------------------------------------------------------
 create table public.requests (
   id                 bigint generated always as identity primary key,
-  kind               text not null check (kind in ('transfer','deposit','withdrawal')),
+  kind               text not null check (kind in ('transfer','deposit','withdrawal','commission')),
+  settlement_id      bigint,  -- kind = commission: which settlement line this pays
   vendor_id          uuid not null references public.profiles(id),
   from_account       uuid references public.accounts(id) on delete cascade,
   to_account         uuid references public.accounts(id) on delete cascade,
@@ -195,6 +196,15 @@ begin
     end if;
   end if;
 
+  if r.kind = 'commission' then
+    update settlements set
+      status      = case when p_accept then 'received' else 'due' end,
+      payout      = case when p_accept then (case when r.to_account is null then 'withdrawal' else 'id' end) end,
+      request_id  = case when p_accept then r.id end,
+      received_at = case when p_accept then now() end
+    where id = r.settlement_id;
+  end if;
+
   update requests set
     status = case when p_accept then 'completed' else 'rejected' end,
     response_note = nullif(trim(p_note), ''),
@@ -213,6 +223,8 @@ begin
   update requests set status = 'cancelled', responded_by = auth.uid(), responded_at = now()
    where id = p_id and status = 'pending';
   if not found then raise exception 'Only pending requests can be cancelled'; end if;
+  update settlements set status = 'due', request_id = null
+   where request_id = p_id and status = 'requested';
 end $$;
 
 -- ---------------------------------------------------------------------
@@ -225,6 +237,7 @@ create table public.pnl_entries (
   settle_date date not null default public.settle_day(now()),
   amount      numeric(14,2) not null check (amount <> 0),
   note        text,
+  bet_id      bigint unique,   -- set when the entry comes from a settled bet
   created_by  uuid default auth.uid(),
   created_at  timestamptz not null default now()
 );
@@ -259,11 +272,13 @@ create table public.settlements (
   net_pnl         numeric(14,2) not null,
   commission_pct  numeric(5,2) not null,
   commission      numeric(14,2) not null,
-  status          text not null default 'due' check (status in ('due','received')),
+  status          text not null default 'due' check (status in ('due','requested','received')),
+  payout          text check (payout in ('id','withdrawal','other')),  -- how it was received
+  request_id      bigint,
   created_at      timestamptz not null default now(),
-  received_at     timestamptz,
-  unique (account_id, settle_date)
+  received_at     timestamptz
 );
+create index on public.settlements (account_id, settle_date);
 
 create or replace function public.run_settlement(p_date date default null) returns integer
 language plpgsql security definer set search_path = public as $$
@@ -274,16 +289,116 @@ begin
   -- auth.uid() is null only for the scheduled job / SQL editor (clients can't call this as anon).
   if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
 
+  -- Re-calculate whatever is still unpaid. Lines already requested / received stay as they are;
+  -- if more loss was entered for the day afterwards, only the difference is added as a new line.
   delete from settlements where settle_date = d and status = 'due';
 
   insert into settlements (account_id, vendor_id, settle_date, net_pnl, commission_pct, commission)
-  select a.id, a.vendor_id, d, t.net, a.commission_pct, round(-t.net * a.commission_pct / 100, 2)
+  select a.id, a.vendor_id, d, t.net, a.commission_pct,
+         round(-t.net * a.commission_pct / 100, 2) - coalesce(done.amount, 0)
     from (select account_id, sum(amount) net from pnl_entries where settle_date = d group by account_id) t
     join accounts a on a.id = t.account_id
+    left join (select account_id, sum(commission) amount from settlements
+                where settle_date = d and status in ('requested','received') group by account_id) done
+           on done.account_id = t.account_id
    where t.net < 0
-  on conflict (account_id, settle_date) do nothing;   -- keep rows already marked received
+     and round(-t.net * a.commission_pct / 100, 2) - coalesce(done.amount, 0) > 0;
   get diagnostics n = row_count;
   return n;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- Bets per ID (owner only). A settled bet automatically becomes a P&L entry,
+-- so balances, commission and the dashboard all include it.
+--   Back: won = stake × (odds − 1), lost = − stake
+--   Lay:  won (selection lost) = + stake, lost (selection won) = − stake × (odds − 1)
+-- ---------------------------------------------------------------------
+create table public.bets (
+  id           bigint generated always as identity primary key,
+  account_id   uuid not null references public.accounts(id) on delete cascade,
+  settle_date  date not null default public.settle_day(now()),
+  event        text,
+  market       text,
+  selection    text,
+  side         text not null default 'back' check (side in ('back','lay')),
+  stake        numeric(14,2) not null check (stake > 0),
+  odds         numeric(10,3) not null check (odds > 1),
+  result       text not null default 'open' check (result in ('open','won','lost','void')),
+  pnl          numeric(14,2) generated always as (
+                 case
+                   when result = 'won'  and side = 'back' then round(stake * (odds - 1), 2)
+                   when result = 'lost' and side = 'back' then -stake
+                   when result = 'won'  and side = 'lay'  then stake
+                   when result = 'lost' and side = 'lay'  then -round(stake * (odds - 1), 2)
+                   else 0
+                 end) stored,
+  note         text,
+  created_by   uuid default auth.uid(),
+  created_at   timestamptz not null default now(),
+  settled_at   timestamptz
+);
+create index on public.bets (account_id);
+create index on public.bets (settle_date);
+
+create or replace function public.bets_sync() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op in ('UPDATE','DELETE') then
+    delete from pnl_entries where bet_id = old.id;
+  end if;
+  if tg_op in ('INSERT','UPDATE') and new.pnl <> 0 then
+    insert into pnl_entries (account_id, settle_date, amount, note, bet_id, created_by)
+    values (new.account_id, new.settle_date, new.pnl,
+            concat_ws(' ', 'Bet #' || new.id, nullif(new.event, ''), nullif(new.selection, ''),
+                      upper(new.side) || ' @ ' || rtrim(to_char(new.odds, 'FM9999990.999'), '.'),
+                      'stake ' || new.stake, new.result),
+            new.id, auth.uid());
+  end if;
+  return coalesce(new, old);
+end $$;
+
+create or replace function public.bets_stamp() returns trigger
+language plpgsql as $$
+begin
+  if new.result <> 'open' and (tg_op = 'INSERT' or old.result = 'open') then new.settled_at := now(); end if;
+  if new.result = 'open' then new.settled_at := null; end if;
+  return new;
+end $$;
+
+create trigger bets_stamp before insert or update on public.bets for each row execute function public.bets_stamp();
+create trigger bets_sync after insert or update or delete on public.bets for each row execute function public.bets_sync();
+
+-- Commission payout: ask the vendor to either credit it into the ID (p_mode 'id')
+-- or pay it out like a withdrawal by cash / bank / UPI (p_mode 'withdrawal').
+-- p_extra takes the same keys as create_request (method, payee_name, token_no, ...).
+create or replace function public.request_commission(p_settlement bigint, p_mode text, p_note text default null, p_extra jsonb default '{}')
+returns bigint
+language plpgsql security definer set search_path = public as $$
+declare s settlements%rowtype; v_id bigint;
+begin
+  if not is_admin() then raise exception 'Only the owner can do this'; end if;
+  select * into s from settlements where id = p_settlement for update;
+  if not found then raise exception 'Commission line not found'; end if;
+  if s.status <> 'due' then raise exception 'This commission is already %', s.status; end if;
+  if s.commission <= 0 then raise exception 'Nothing to collect'; end if;
+  if p_mode not in ('id','withdrawal') then raise exception 'Choose credit to ID or withdrawal'; end if;
+  p_extra := case when p_mode = 'id' then '{}'::jsonb else coalesce(p_extra, '{}') end;
+  if p_extra->>'photo_path' is not null and p_extra->>'photo_path' not like s.vendor_id::text || '/%' then
+    raise exception 'Photo must be stored in the vendor folder';
+  end if;
+
+  insert into requests (kind, vendor_id, to_account, amount, note, created_by, settlement_id,
+                        method, payee_name, payee_phone, token_no, payee_details, photo_path)
+  values ('commission', s.vendor_id, case when p_mode = 'id' then s.account_id end, s.commission,
+          coalesce(nullif(trim(p_note), ''), 'Commission for ' || to_char(s.settle_date, 'DD Mon YYYY')),
+          auth.uid(), s.id,
+          nullif(p_extra->>'method', ''), nullif(trim(p_extra->>'payee_name'), ''),
+          nullif(trim(p_extra->>'payee_phone'), ''), nullif(trim(p_extra->>'token_no'), ''),
+          nullif(trim(p_extra->>'payee_details'), ''), nullif(p_extra->>'photo_path', ''))
+  returning id into v_id;
+
+  update settlements set status = 'requested', request_id = v_id where id = s.id;
+  return v_id;
 end $$;
 
 -- ---------------------------------------------------------------------
@@ -385,6 +500,7 @@ alter table public.requests    enable row level security;
 alter table public.pnl_entries enable row level security;
 alter table public.settlements enable row level security;
 alter table public.ledger      enable row level security;
+alter table public.bets        enable row level security;
 
 create policy profiles_read   on public.profiles for select using (is_admin() or id = auth.uid());
 create policy profiles_update on public.profiles for update using (is_admin()) with check (is_admin());
@@ -409,6 +525,7 @@ create policy settlements_read  on public.settlements for select
 create policy settlements_admin on public.settlements for update using (is_admin()) with check (is_admin());
 
 create policy ledger_admin on public.ledger for all using (is_admin()) with check (is_admin());
+create policy bets_admin   on public.bets   for all using (is_admin()) with check (is_admin());
 
 -- Functions: only logged-in users may call them (each checks the role inside).
 revoke execute on all functions in schema public from public, anon;
@@ -416,6 +533,7 @@ grant  execute on function public.settle_day(timestamptz), public.is_admin(), pu
        public.create_request(text, uuid, uuid, numeric, text, jsonb), public.respond_request(bigint, boolean, text, text),
        public.owner_contact(),
        public.cancel_request(bigint), public.run_settlement(date),
+       public.request_commission(bigint, text, text, jsonb),
        public.admin_create_vendor(text, text, text, text), public.admin_set_password(uuid, text),
        public.admin_set_active(uuid, boolean)
   to authenticated;
@@ -424,13 +542,13 @@ revoke execute on function public._create_login(text, text, text, text, text), p
 
 -- Supabase grants table access to the "anon" role by default; RLS already blocks it, this makes it explicit.
 revoke all on public.profiles, public.accounts, public.requests, public.pnl_entries,
-              public.settlements, public.ledger from anon;
+              public.settlements, public.ledger, public.bets from anon;
 
 -- ---------------------------------------------------------------------
 -- Live updates in the browser
 -- ---------------------------------------------------------------------
 alter publication supabase_realtime add table
-  public.profiles, public.accounts, public.requests, public.pnl_entries, public.settlements, public.ledger;
+  public.profiles, public.accounts, public.requests, public.pnl_entries, public.settlements, public.ledger, public.bets;
 
 -- ---------------------------------------------------------------------
 -- Photos (cash tokens, slips, proofs). Private bucket; files are stored as
