@@ -1,0 +1,933 @@
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+const CFG = window.APP_CONFIG || {};
+const sb = createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
+const APP_URL = location.origin + location.pathname;
+
+const KIND = { transfer: 'Transfer', deposit: 'Deposit', withdrawal: 'Withdrawal' };
+const METHOD = { cash: 'Cash', bank_deposit: 'Bank deposit', bank_transfer: 'Bank transfer', upi: 'UPI' };
+const LEDGER_MODES = ['Cash', 'UPI', 'Bank transfer', 'Bank deposit', 'Other'];
+
+const S = {
+  me: null,
+  owner: null,
+  view: null,
+  live: false,
+  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [] },
+  f: { idSearch: '', idVendor: '', idStatus: 'active', reqTab: 'pending', reqVendor: '', pnlDate: null, comDate: null, ledVendor: '' },
+};
+const isAdmin = () => S.me?.role === 'admin';
+
+// ---------- helpers ----------
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const inr = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 });
+const money = (n) => inr.format(Number(n || 0));
+const signed = (n) => `<span class="num ${n > 0 ? 'pos' : n < 0 ? 'neg' : ''}">${n > 0 ? '+' : ''}${money(n)}</span>`;
+const sum = (arr, fn) => arr.reduce((t, x) => t + Number(fn(x) || 0), 0);
+const fmtDT = (s) => s ? new Date(s).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+const fmtD = (s) => s ? new Date(s + 'T00:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+// Settlement day: 11:00 AM IST → 11:00 AM IST (IST = UTC+5:30, minus 11h = UTC−5:30)
+const settleDay = (d = new Date()) => new Date(d.getTime() - 5.5 * 3600e3).toISOString().slice(0, 10);
+const addDays = (iso, n) => { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const todayIST = () => new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10);
+
+const acc = (id) => S.data.accounts.find((a) => a.id === id);
+const prof = (id) => S.data.profiles.find((p) => p.id === id);
+const accName = (a) => a ? `${a.site_name ? a.site_name + ' · ' : ''}${a.username}` : '(deleted ID)';
+const vendorName = (id) => prof(id)?.name || (id === S.me?.id ? S.me.name : '—');
+const vendors = () => S.data.profiles.filter((p) => p.role === 'vendor').sort((a, b) => a.name.localeCompare(b.name));
+
+function toast(msg, type = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  $('#toasts').append(el);
+  setTimeout(() => el.remove(), type === 'error' ? 5000 : 2600);
+}
+const fail = (e) => toast(e?.message || String(e), 'error');
+
+const modal = $('#modal');
+modal.addEventListener('click', (e) => { if (e.target === modal || e.target.closest('[data-close]')) modal.close(); });
+function openModal(title, html, mount) {
+  $('#modal-title').textContent = title;
+  $('#modal-body').innerHTML = html;
+  if (!modal.open) modal.showModal();
+  mount?.($('#modal-body'));
+}
+
+async function copy(text, what = 'Copied') {
+  try { await navigator.clipboard.writeText(text); toast(what); } catch { prompt('Copy:', text); }
+}
+
+function waUrl(phone, text) {
+  let d = String(phone || '').replace(/\D/g, '');
+  if (d.length === 10) d = '91' + d;
+  return `https://wa.me/${d}?text=${encodeURIComponent(text)}`;
+}
+const openWA = (phone, text) => window.open(waUrl(phone, text), '_blank', 'noopener');
+// Opens the tab during the click (so phones don't block it), then fills in the link once the text is ready.
+async function openWAAsync(phone, textPromise) {
+  const w = window.open('about:blank', '_blank');
+  try { const url = waUrl(phone, await textPromise); if (w) w.location.href = url; else location.href = url; }
+  catch (e) { w?.close(); throw e; }
+}
+
+const formObj = (form) => Object.fromEntries(new FormData(form).entries());
+const busy = async (btn, fn) => {
+  const label = btn?.innerHTML; if (btn) { btn.disabled = true; btn.innerHTML = 'Please wait…'; }
+  try { return await fn(); } catch (e) { fail(e); } finally { if (btn) { btn.disabled = false; btn.innerHTML = label; } }
+};
+const must = ({ data, error }) => { if (error) throw error; return data; };
+
+// ---------- photos ----------
+async function compressImage(file, max = 1400) {
+  const img = await createImageBitmap(file);
+  const scale = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return new Promise((res) => c.toBlob(res, 'image/jpeg', 0.8));
+}
+async function uploadPhoto(file, vendorId) {
+  if (!file || !file.size) return null;
+  const blob = await compressImage(file);
+  const path = `${vendorId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+  must(await sb.storage.from('proofs').upload(path, blob, { contentType: 'image/jpeg' }));
+  return path;
+}
+async function photoUrl(path, seconds = 3600) {
+  const { data, error } = await sb.storage.from('proofs').createSignedUrl(path, seconds);
+  if (error) throw error;
+  return data.signedUrl;
+}
+async function showPhoto(path) {
+  try {
+    const url = await photoUrl(path);
+    openModal('Photo', `<img src="${esc(url)}" alt="Photo" style="width:100%;border-radius:10px">
+      <div class="row" style="margin-top:10px"><a class="btn sm" href="${esc(url)}" target="_blank" rel="noopener">Open full size</a></div>`);
+  } catch (e) { fail(e); }
+}
+
+// ---------- data ----------
+async function fetchAll(table, order) {
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    const rows = must(await sb.from(table).select('*').order(order, { ascending: false }).range(from, from + 999));
+    out.push(...rows);
+    if (rows.length < 1000) return out;
+  }
+}
+async function loadData() {
+  const admin = isAdmin();
+  const [profiles, accounts, requests, settlements, pnl, ledger] = await Promise.all([
+    fetchAll('profiles', 'created_at'),
+    fetchAll('accounts', 'created_at'),
+    fetchAll('requests', 'created_at'),
+    fetchAll('settlements', 'settle_date'),
+    admin ? fetchAll('pnl_entries', 'created_at') : [],
+    admin ? fetchAll('ledger', 'entry_date') : [],
+  ]);
+  S.data = { profiles, accounts, requests, settlements, pnl, ledger };
+  const me = profiles.find((p) => p.id === S.me.id);
+  if (me) S.me = me;
+}
+
+let reloadTimer;
+function scheduleReload() {
+  clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(async () => {
+    try { await loadData(); renderView(); } catch (e) { console.error(e); }
+  }, 350);
+}
+let channel;
+function subscribeLive() {
+  channel?.unsubscribe();
+  channel = sb.channel('db-changes')
+    .on('postgres_changes', { event: '*', schema: 'public' }, scheduleReload)
+    .subscribe((status) => { S.live = status === 'SUBSCRIBED'; const d = $('.live-dot'); d?.classList.toggle('on', S.live); });
+}
+
+// ---------- auth ----------
+function renderLogin(msg = '') {
+  const missing = !CFG.SUPABASE_URL || CFG.SUPABASE_URL.includes('YOUR-PROJECT');
+  $('#app').innerHTML = `
+    <div class="login">
+      <div class="card">
+        <h1>ID Ledger</h1>
+        <p class="muted small" style="margin:0 0 16px">Sign in with the username and password you were given.</p>
+        ${missing ? `<p class="neg small">Setup needed: fill in <b>config.js</b> with your Supabase URL and key.</p>` : ''}
+        <form id="login-form">
+          <div class="field"><label for="lu">Username</label><input id="lu" name="username" autocomplete="username" autocapitalize="none" required></div>
+          <div class="field"><label for="lp">Password</label><input id="lp" name="password" type="password" autocomplete="current-password" required></div>
+          ${msg ? `<p class="neg small">${esc(msg)}</p>` : ''}
+          <button class="btn primary block" type="submit">Sign in</button>
+        </form>
+      </div>
+    </div>`;
+  $('#login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const { username, password } = formObj(e.target);
+    const u = username.trim().toLowerCase();
+    const email = u.includes('@') ? u : `${u}@${CFG.LOGIN_DOMAIN || 'ledger.local'}`;
+    await busy(e.submitter, async () => {
+      const { error } = await sb.auth.signInWithPassword({ email, password });
+      if (error) return renderLogin(error.message === 'Invalid login credentials' ? 'Wrong username or password' : error.message);
+    });
+  });
+}
+
+async function startSession(user) {
+  const { data: me } = await sb.from('profiles').select('*').eq('id', user.id).maybeSingle();
+  if (!me || !me.active) {
+    await sb.auth.signOut();
+    return renderLogin('This login is not active. Contact the owner.');
+  }
+  S.me = me;
+  S.view = S.view || (isAdmin() ? 'dashboard' : 'ids');
+  try { await loadData(); } catch (e) { fail(e); }
+  if (!isAdmin()) {
+    const { data } = await sb.rpc('owner_contact');
+    S.owner = data?.[0] || null;
+  }
+  renderShell();
+  subscribeLive();
+}
+
+let sessionUser; // undefined until the first auth event, so a logged-out start still shows the login
+sb.auth.onAuthStateChange((event, session) => {
+  const uid = session?.user?.id || null;
+  if (uid === sessionUser) return;
+  sessionUser = uid;
+  if (uid) setTimeout(() => startSession(session.user), 0);
+  else { channel?.unsubscribe(); S.me = null; S.view = null; renderLogin(); }
+});
+
+// ---------- shell ----------
+function navItems() {
+  const pend = S.data.requests.filter((r) => r.status === 'pending').length;
+  return isAdmin()
+    ? [['dashboard', 'Dashboard'], ['ids', 'IDs'], ['requests', 'Requests', pend], ['pnl', 'P&L'], ['commission', 'Commission'], ['ledger', 'Ledger'], ['vendors', 'Vendors']]
+    : [['ids', 'My IDs'], ['requests', 'Requests', pend], ['commission', 'Commission']];
+}
+function renderShell() {
+  $('#app').innerHTML = `
+    <header class="topbar">
+      <div class="topbar-row">
+        <span class="brand">ID Ledger</span>
+        <span class="live-dot ${S.live ? 'on' : ''}" title="Live updates"></span>
+        <span class="spacer"></span>
+        ${!isAdmin() && S.owner?.phone ? `<button class="btn sm wa" id="ask-owner">WhatsApp owner</button>` : ''}
+        <span class="muted small who">${esc(S.me.name)}</span>
+        <button class="btn sm" id="logout">Sign out</button>
+      </div>
+      <nav class="tabs" id="tabs"></nav>
+    </header>
+    <main id="view"></main>`;
+  $('#logout').onclick = () => sb.auth.signOut();
+  $('#ask-owner')?.addEventListener('click', () => openWA(S.owner.phone, `Hi ${S.owner.name}, `));
+  $('#tabs').addEventListener('click', (e) => {
+    const t = e.target.closest('[data-view]'); if (!t) return;
+    S.view = t.dataset.view; renderView(); window.scrollTo(0, 0);
+  });
+  renderView();
+}
+function renderTabs() {
+  $('#tabs').innerHTML = navItems().map(([k, label, n]) =>
+    `<button class="tab ${S.view === k ? 'active' : ''}" data-view="${k}">${label}${n ? `<span class="badge-count">${n}</span>` : ''}</button>`).join('');
+}
+function renderView() {
+  if (!S.me || !$('#view')) return;
+  renderTabs();
+  const v = $('#view');
+  const views = { dashboard: viewDashboard, ids: viewIds, requests: viewRequests, pnl: viewPnl, commission: viewCommission, ledger: viewLedger, vendors: viewVendors };
+  const fn = views[S.view] || viewIds;
+  // keep focus/scroll on live refresh
+  const active = document.activeElement?.id; const pos = active ? document.activeElement.selectionStart : null;
+  const typed = [...v.querySelectorAll('form[id] input[name]:not([type=file]):not([type=radio]):not([type=checkbox])')]
+    .filter((i) => i.value !== i.defaultValue).map((i) => [i.form.id, i.name, i.value]);
+  fn(v);
+  typed.forEach(([f, n, val]) => { const i = document.getElementById(f)?.elements[n]; if (i && 'value' in i) i.value = val; });
+  if (active && document.getElementById(active)) {
+    const el = document.getElementById(active); el.focus();
+    try { if (pos != null) el.setSelectionRange(pos, pos); } catch {}
+  }
+}
+
+// ---------- numbers ----------
+function vendorStats(vid) {
+  const accs = S.data.accounts.filter((a) => a.vendor_id === vid);
+  const ids = new Set(accs.map((a) => a.id));
+  const pnl = S.data.pnl.filter((p) => ids.has(p.account_id));
+  const day = settleDay();
+  const led = S.data.ledger.filter((l) => l.vendor_id === vid);
+  return {
+    count: accs.filter((a) => a.status === 'active').length,
+    balance: sum(accs.filter((a) => a.status === 'active'), (a) => a.current_balance),
+    todayPnl: sum(pnl.filter((p) => p.settle_date === day), (p) => p.amount),
+    totalPnl: sum(pnl, (p) => p.amount),
+    commDue: sum(S.data.settlements.filter((s) => s.vendor_id === vid && s.status === 'due'), (s) => s.commission),
+    paid: sum(led.filter((l) => l.direction === 'out'), (l) => l.amount),
+    received: sum(led.filter((l) => l.direction === 'in'), (l) => l.amount),
+    pending: S.data.requests.filter((r) => r.vendor_id === vid && r.status === 'pending'),
+  };
+}
+// Live (not yet settled) commission estimate for a settlement day
+function commissionPreview(day) {
+  const byAcc = {};
+  S.data.pnl.filter((p) => p.settle_date === day).forEach((p) => { byAcc[p.account_id] = (byAcc[p.account_id] || 0) + Number(p.amount); });
+  return Object.entries(byAcc).map(([id, net]) => {
+    const a = acc(id); const pct = Number(a?.commission_pct || 0);
+    return { account_id: id, vendor_id: a?.vendor_id, net, pct, commission: net < 0 ? Math.round(-net * pct) / 100 : 0 };
+  });
+}
+
+// ---------- WhatsApp texts ----------
+async function requestMessage(r) {
+  const lines = [`*${KIND[r.kind]} request #${r.id}*`];
+  if (r.kind === 'transfer') lines.push(`From ID: ${accName(acc(r.from_account))}`, `To ID: ${accName(acc(r.to_account))}`);
+  if (r.kind === 'deposit') lines.push(`Deposit into ID: ${accName(acc(r.to_account))}`);
+  if (r.kind === 'withdrawal') lines.push(`Withdraw from ID: ${accName(acc(r.from_account))}`);
+  lines.push(`Amount: ${money(r.amount)}`);
+  if (r.method) lines.push(`Method: ${METHOD[r.method]}`);
+  if (r.payee_name || r.payee_phone) lines.push(`${r.kind === 'withdrawal' ? 'Cash to be given to' : 'Person'}: ${[r.payee_name, r.payee_phone].filter(Boolean).join(' – ')}`);
+  if (r.token_no) lines.push(`Token no: ${r.token_no}`);
+  if (r.payee_details) lines.push(`Details: ${r.payee_details}`);
+  else if (r.method && r.method !== 'cash') lines.push(`Ask me for the ${METHOD[r.method]} details before doing this.`);
+  if (r.photo_path) { try { lines.push(`Photo: ${await photoUrl(r.photo_path, 7 * 86400)}`); } catch {} }
+  if (r.note) lines.push(`Note: ${r.note}`);
+  if (r.status === 'pending') lines.push('', `Please complete it and press *Accept* in the app: ${APP_URL}`);
+  else lines.push('', `Status: ${r.status}`);
+  return lines.join('\n');
+}
+function reminderMessage(vid) {
+  const pend = S.data.requests.filter((r) => r.vendor_id === vid && r.status === 'pending').sort((a, b) => a.id - b.id);
+  const v = prof(vid);
+  if (!pend.length) return `Hi ${v?.name || ''}, `;
+  return [`Hi ${v?.name || ''}, reminder – ${pend.length} pending request${pend.length > 1 ? 's' : ''}:`, '',
+    ...pend.map((r) => `#${r.id} ${KIND[r.kind]} ${money(r.amount)} – ${r.kind === 'transfer' ? `${accName(acc(r.from_account))} → ${accName(acc(r.to_account))}` : accName(acc(r.from_account || r.to_account))}${r.method ? ` (${METHOD[r.method]})` : ''}`),
+    '', `Please complete and accept in the app: ${APP_URL}`].join('\n');
+}
+
+// ============================================================
+// DASHBOARD (owner only)
+// ============================================================
+function viewDashboard(v) {
+  if (!isAdmin()) return viewIds(v);
+  const day = settleDay();
+  const active = S.data.accounts.filter((a) => a.status === 'active');
+  const todayPnl = sum(S.data.pnl.filter((p) => p.settle_date === day), (p) => p.amount);
+  const totalPnl = sum(S.data.pnl, (p) => p.amount);
+  const commDue = sum(S.data.settlements.filter((s) => s.status === 'due'), (s) => s.commission);
+  const commToday = sum(commissionPreview(day), (c) => c.commission);
+  const paid = sum(S.data.ledger.filter((l) => l.direction === 'out'), (l) => l.amount);
+  const received = sum(S.data.ledger.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const pending = S.data.requests.filter((r) => r.status === 'pending');
+
+  v.innerHTML = `
+    <div class="section kpis">
+      ${kpi('Balance in IDs', money(sum(active, (a) => a.current_balance)), `${active.length} active IDs`)}
+      ${kpi("Today's P&L", signed(todayPnl), `Settlement day ${fmtD(day)}`)}
+      ${kpi('Total P&L', signed(totalPnl), 'All time')}
+      ${kpi('Commission due', money(commDue), `Today so far: ${money(commToday)}`)}
+      ${kpi('Pending requests', pending.length, pending.length ? 'Waiting for vendors' : 'All clear')}
+      ${kpi('Paid to vendors', money(paid), 'Payment ledger')}
+      ${kpi('Received from vendors', money(received), 'Payment ledger')}
+      ${kpi('Ledger net', signed(received - paid), 'Received − paid')}
+    </div>
+    <div class="section">
+      <div class="section-head"><h2>Vendors</h2></div>
+      ${vendors().length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Vendor</th><th class="r">IDs</th><th class="r">Balance</th><th class="r">Today P&L</th><th class="r">Total P&L</th><th class="r">Comm. due</th><th class="r">Paid</th><th class="r">Received</th><th class="r">Pending</th><th></th></tr></thead>
+        <tbody>${vendors().map((p) => { const s = vendorStats(p.id); return `<tr>
+          <td><b>${esc(p.name)}</b>${p.active ? '' : ' <span class="pill closed">off</span>'}</td>
+          <td class="r">${s.count}</td><td class="r num">${money(s.balance)}</td>
+          <td class="r">${signed(s.todayPnl)}</td><td class="r">${signed(s.totalPnl)}</td>
+          <td class="r num">${money(s.commDue)}</td><td class="r num">${money(s.paid)}</td><td class="r num">${money(s.received)}</td>
+          <td class="r">${s.pending.length || ''}</td>
+          <td><button class="btn sm wa" data-remind="${p.id}" ${p.phone ? '' : 'disabled title="Add phone in Vendors"'}>${s.pending.length ? 'Remind' : 'WhatsApp'}</button></td>
+        </tr>`; }).join('')}</tbody></table></div>` : `<div class="empty">No vendors yet. Create one in <b>Vendors</b>.</div>`}
+    </div>
+    <div class="section">
+      <div class="section-head"><h2>Pending requests</h2><button class="btn sm primary" id="dash-new-req">+ New request</button></div>
+      <div class="list" id="dash-pending">${pending.length ? pending.map(requestCard).join('') : '<div class="empty">No pending requests</div>'}</div>
+    </div>`;
+  v.querySelectorAll('[data-remind]').forEach((b) => b.onclick = () => openWA(prof(b.dataset.remind)?.phone, reminderMessage(b.dataset.remind)));
+  $('#dash-new-req').onclick = () => requestForm();
+  bindRequestCards($('#dash-pending'));
+}
+const kpi = (label, value, sub = '') => `<div class="kpi"><div class="label">${label}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
+
+// ============================================================
+// IDs
+// ============================================================
+function viewIds(v) {
+  v.innerHTML = `
+    <div class="section-head"><h2>${isAdmin() ? 'IDs' : 'My IDs'}</h2><button class="btn primary" id="add-id">+ Add ID</button></div>
+    <div class="toolbar">
+      <input id="id-search" type="search" placeholder="Search site / username" value="${esc(S.f.idSearch)}">
+      ${isAdmin() ? `<select id="id-vendor"><option value="">All vendors</option>${vendors().map((p) => `<option value="${p.id}" ${S.f.idVendor === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : ''}
+      <select id="id-status"><option value="active">Active</option><option value="closed">Closed</option><option value="">All</option></select>
+    </div>
+    <div id="id-summary" class="muted small" style="margin-bottom:10px"></div>
+    <div class="grid" id="id-list"></div>`;
+  $('#id-status').value = S.f.idStatus;
+  $('#add-id').onclick = () => idForm();
+  $('#id-search').oninput = (e) => { S.f.idSearch = e.target.value; drawIdList(); };
+  $('#id-vendor')?.addEventListener('change', (e) => { S.f.idVendor = e.target.value; drawIdList(); });
+  $('#id-status').onchange = (e) => { S.f.idStatus = e.target.value; drawIdList(); };
+  $('#id-list').addEventListener('click', onIdListClick);
+  drawIdList();
+}
+function filteredIds() {
+  const q = S.f.idSearch.trim().toLowerCase();
+  return S.data.accounts.filter((a) =>
+    (!S.f.idStatus || a.status === S.f.idStatus) &&
+    (!S.f.idVendor || a.vendor_id === S.f.idVendor) &&
+    (!q || `${a.site_name} ${a.username} ${vendorName(a.vendor_id)}`.toLowerCase().includes(q)));
+}
+function drawIdList() {
+  const list = filteredIds();
+  $('#id-summary').textContent = `${list.length} ID${list.length === 1 ? '' : 's'} · Total balance ${money(sum(list, (a) => a.current_balance))}`;
+  const day = settleDay();
+  $('#id-list').innerHTML = list.length ? list.map((a) => {
+    const today = sum(S.data.pnl.filter((p) => p.account_id === a.id && p.settle_date === day), (p) => p.amount);
+    const pend = S.data.requests.filter((r) => r.status === 'pending' && (r.from_account === a.id || r.to_account === a.id)).length;
+    return `<div class="card stack" data-id="${a.id}">
+      <div class="row between">
+        <div><h3>${esc(accName(a))}</h3>${isAdmin() ? `<div class="muted small">${esc(vendorName(a.vendor_id))}</div>` : ''}</div>
+        <span class="pill ${a.status}">${a.status}</span>
+      </div>
+      <div class="row between">
+        <div><div class="muted small">Current balance</div><div class="big">${money(a.current_balance)}</div></div>
+        <div style="text-align:right"><div class="muted small">Start ${money(a.opening_balance)}</div>
+          <div class="small">Commission <b>${Number(a.commission_pct)}%</b></div>
+          ${isAdmin() && today ? `<div class="small">Today ${signed(today)}</div>` : ''}</div>
+      </div>
+      <dl class="kv">
+        <dt>Username</dt><dd><span class="secret">${esc(a.username)}</span> <button class="icon-btn" data-act="copy-user" title="Copy">⧉</button></dd>
+        <dt>Password</dt><dd><span class="secret" data-pw>••••••</span> <button class="icon-btn" data-act="show-pw" title="Show">👁</button><button class="icon-btn" data-act="copy-pw" title="Copy">⧉</button></dd>
+        ${a.login_url ? `<dt>Login</dt><dd><a href="${esc(safeUrl(a.login_url))}" target="_blank" rel="noopener noreferrer">${esc(a.login_url)}</a></dd>` : ''}
+        ${a.notes ? `<dt>Notes</dt><dd>${esc(a.notes)}</dd>` : ''}
+      </dl>
+      ${pend ? `<div class="small"><span class="pill pending">${pend} pending request${pend > 1 ? 's' : ''}</span></div>` : ''}
+      <div class="row">
+        <button class="btn sm" data-act="statement">Statement</button>
+        <button class="btn sm" data-act="edit">Edit</button>
+        ${isAdmin() ? `<button class="btn sm" data-act="pnl">+ P&L</button><button class="btn sm" data-act="req">Request</button>` : ''}
+      </div>
+    </div>`;
+  }).join('') : `<div class="empty" style="grid-column:1/-1">No IDs here yet.</div>`;
+}
+const safeUrl = (u) => /^https?:\/\//i.test(u) ? u : `https://${u}`;
+function onIdListClick(e) {
+  const btn = e.target.closest('[data-act]'); if (!btn) return;
+  const card = btn.closest('[data-id]'); const a = acc(card.dataset.id); if (!a) return;
+  const act = btn.dataset.act;
+  if (act === 'copy-user') copy(a.username, 'Username copied');
+  if (act === 'copy-pw') copy(a.password || '', 'Password copied');
+  if (act === 'show-pw') { const s = card.querySelector('[data-pw]'); s.textContent = s.textContent.startsWith('•') ? (a.password || '—') : '••••••'; }
+  if (act === 'edit') idForm(a);
+  if (act === 'statement') statement(a);
+  if (act === 'pnl') pnlQuick(a);
+  if (act === 'req') requestForm({ vendor: a.vendor_id, from: a.id });
+}
+
+function idForm(a = null) {
+  const admin = isAdmin();
+  const vs = vendors().filter((p) => p.active || p.id === a?.vendor_id);
+  if (admin && !vs.length) return toast('Create a vendor first (Vendors tab)', 'error');
+  openModal(a ? 'Edit ID' : 'Add ID', `
+    <form id="id-form">
+      ${admin ? `<div class="field"><label>Vendor</label><select name="vendor_id" required>${vs.map((p) => `<option value="${p.id}" ${a?.vendor_id === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>` : ''}
+      <div class="fields two">
+        <div class="field"><label>Site / panel name</label><input name="site_name" value="${esc(a?.site_name)}" placeholder="e.g. SiteX"></div>
+        <div class="field"><label>Login link</label><input name="login_url" value="${esc(a?.login_url)}" inputmode="url" placeholder="https://…"></div>
+        <div class="field"><label>ID / username *</label><input name="username" value="${esc(a?.username)}" required autocapitalize="none"></div>
+        <div class="field"><label>Password</label><input name="password" value="${esc(a?.password)}" autocapitalize="none"></div>
+        ${!a || admin ? `<div class="field"><label>Start balance (deposit) ₹</label><input name="opening_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a?.opening_balance ?? '')}" required></div>` : ''}
+        ${a && admin ? `<div class="field"><label>Current balance ₹ (correction)</label><input name="current_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a.current_balance)}"></div>` : ''}
+        <div class="field"><label>Commission % on daily loss</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? '')}" required></div>
+        ${a ? `<div class="field"><label>Status</label><select name="status"><option value="active">Active</option><option value="closed" ${a.status === 'closed' ? 'selected' : ''}>Closed</option></select></div>` : ''}
+      </div>
+      <div class="field"><label>Notes</label><textarea name="notes">${esc(a?.notes)}</textarea></div>
+      ${a && !admin ? `<p class="muted small">Balance changes only through requests you accept.</p>` : ''}
+      <button class="btn primary block" type="submit">${a ? 'Save' : 'Add ID'}</button>
+      ${a && admin ? `<button class="btn danger block" type="button" id="del-id" style="margin-top:8px">Delete ID and its history</button>` : ''}
+    </form>`, (root) => {
+    $('#id-form', root).onsubmit = (e) => {
+      e.preventDefault();
+      const f = formObj(e.target);
+      const row = {
+        site_name: f.site_name.trim() || null, login_url: f.login_url.trim() || null, username: f.username.trim(),
+        password: f.password || null, commission_pct: Number(f.commission_pct || 0), notes: f.notes.trim() || null,
+      };
+      if (f.status) row.status = f.status;
+      if (admin) row.vendor_id = f.vendor_id;
+      if ('opening_balance' in f) row.opening_balance = Number(f.opening_balance || 0);
+      if (a && admin && f.current_balance !== '' && Number(f.current_balance) !== Number(a.current_balance)) row.current_balance = Number(f.current_balance);
+      busy(e.submitter, async () => {
+        if (a) must(await sb.from('accounts').update(row).eq('id', a.id));
+        else must(await sb.from('accounts').insert(row));
+        modal.close(); toast(a ? 'Saved' : 'ID added'); scheduleReload();
+      });
+    };
+    $('#del-id', root)?.addEventListener('click', (e) => {
+      if (!confirm(`Delete ${accName(a)}? This also deletes its requests, P&L and commission records.`)) return;
+      busy(e.target, async () => { must(await sb.from('accounts').delete().eq('id', a.id)); modal.close(); toast('Deleted'); scheduleReload(); });
+    });
+  });
+}
+
+function statement(a) {
+  const rows = [];
+  S.data.requests.filter((r) => r.from_account === a.id || r.to_account === a.id).forEach((r) => {
+    const out = r.from_account === a.id;
+    const other = r.kind === 'transfer' ? ` ${out ? '→' : '←'} ${accName(acc(out ? r.to_account : r.from_account))}` : '';
+    rows.push({ t: r.responded_at || r.created_at, label: `#${r.id} ${KIND[r.kind]}${other}${r.method ? ` · ${METHOD[r.method]}` : ''}`,
+      amt: r.status === 'completed' ? (out ? -r.amount : +r.amount) : null, raw: r.amount, status: r.status,
+      after: r.status === 'completed' ? (out ? r.from_balance_after : r.to_balance_after) : null });
+  });
+  if (isAdmin()) S.data.pnl.filter((p) => p.account_id === a.id).forEach((p) =>
+    rows.push({ t: p.created_at, label: `P&L for ${fmtD(p.settle_date)}${p.note ? ` · ${p.note}` : ''}`, amt: Number(p.amount), status: 'pnl' }));
+  rows.sort((x, y) => new Date(y.t) - new Date(x.t));
+  openModal(`Statement · ${accName(a)}`, `
+    <div class="row between" style="margin-bottom:12px">
+      <div><div class="muted small">Current balance</div><div class="big">${money(a.current_balance)}</div></div>
+      <div class="muted small" style="text-align:right">Start ${money(a.opening_balance)}<br>Added ${fmtDT(a.created_at)}</div>
+    </div>
+    ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>When</th><th>Entry</th><th class="r">Amount</th><th class="r">Balance after</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr><td>${fmtDT(r.t)}</td><td>${esc(r.label)} ${r.status !== 'completed' && r.status !== 'pnl' ? `<span class="pill ${r.status}">${r.status}</span>` : ''}</td>
+        <td class="r">${r.amt == null ? `<span class="muted num">${money(r.raw)}</span>` : signed(r.amt)}</td><td class="r num">${r.after != null ? money(r.after) : ''}</td></tr>`).join('')}
+    </tbody></table></div>` : '<div class="empty">No entries yet</div>'}`);
+}
+
+// ============================================================
+// REQUESTS (transfer / deposit / withdrawal)
+// ============================================================
+function viewRequests(v) {
+  const tabs = [['pending', 'Pending'], ['completed', 'Completed'], ['all', 'All']];
+  v.innerHTML = `
+    <div class="section-head"><h2>Requests</h2>${isAdmin() ? '<button class="btn primary" id="new-req">+ New request</button>' : ''}</div>
+    <div class="toolbar">
+      <div class="seg" id="req-tabs">${tabs.map(([k, l]) => `<label><input type="radio" name="rt" value="${k}" ${S.f.reqTab === k ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div>
+      ${isAdmin() ? `<select id="req-vendor"><option value="">All vendors</option>${vendors().map((p) => `<option value="${p.id}" ${S.f.reqVendor === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : ''}
+    </div>
+    <div class="list" id="req-list"></div>`;
+  $('#new-req')?.addEventListener('click', () => requestForm());
+  $('#req-tabs').onchange = (e) => { S.f.reqTab = e.target.value; drawReqs(); };
+  $('#req-vendor')?.addEventListener('change', (e) => { S.f.reqVendor = e.target.value; drawReqs(); });
+  bindRequestCards($('#req-list'));
+  drawReqs();
+}
+function drawReqs() {
+  const list = S.data.requests.filter((r) =>
+    (S.f.reqTab === 'all' || (S.f.reqTab === 'pending' ? r.status === 'pending' : r.status === 'completed')) &&
+    (!S.f.reqVendor || r.vendor_id === S.f.reqVendor));
+  $('#req-list').innerHTML = list.length ? list.slice(0, 300).map(requestCard).join('') : '<div class="empty">Nothing here</div>';
+}
+function requestCard(r) {
+  const admin = isAdmin();
+  const vendorPhone = prof(r.vendor_id)?.phone;
+  const needsDetails = r.method && r.method !== 'cash' && !r.payee_details;
+  return `<div class="item" data-req="${r.id}">
+    <div class="row between">
+      <div class="row"><span class="pill kind">${KIND[r.kind]}</span><b>#${r.id}</b><span class="big" style="font-size:1.1rem">${money(r.amount)}</span></div>
+      <span class="pill ${r.status}">${r.status}</span>
+    </div>
+    <dl class="kv" style="margin-top:8px">
+      ${admin ? `<dt>Vendor</dt><dd>${esc(vendorName(r.vendor_id))}</dd>` : ''}
+      ${r.from_account ? `<dt>From ID</dt><dd>${esc(accName(acc(r.from_account)))}${r.from_balance_after != null ? ` <span class="muted small">→ ${money(r.from_balance_after)}</span>` : ''}</dd>` : ''}
+      ${r.to_account ? `<dt>To ID</dt><dd>${esc(accName(acc(r.to_account)))}${r.to_balance_after != null ? ` <span class="muted small">→ ${money(r.to_balance_after)}</span>` : ''}</dd>` : ''}
+      ${r.method ? `<dt>Method</dt><dd>${METHOD[r.method]}</dd>` : ''}
+      ${r.payee_name || r.payee_phone ? `<dt>${r.kind === 'withdrawal' ? 'Cash to' : 'Person'}</dt><dd>${esc(r.payee_name)} ${r.payee_phone ? `<a href="tel:${esc(r.payee_phone)}">${esc(r.payee_phone)}</a>` : ''}</dd>` : ''}
+      ${r.token_no ? `<dt>Token</dt><dd><b>${esc(r.token_no)}</b></dd>` : ''}
+      ${r.payee_details ? `<dt>Details</dt><dd style="white-space:pre-line">${esc(r.payee_details)}</dd>` : ''}
+      ${needsDetails ? `<dt>Details</dt><dd class="neg">${admin ? 'Not given – vendor will ask you' : 'Ask the owner for details'}</dd>` : ''}
+      ${r.note ? `<dt>Note</dt><dd>${esc(r.note)}</dd>` : ''}
+      <dt>Asked</dt><dd>${fmtDT(r.created_at)}</dd>
+      ${r.responded_at ? `<dt>${r.status === 'completed' ? 'Done' : r.status}</dt><dd>${fmtDT(r.responded_at)}${r.response_note ? ` · ${esc(r.response_note)}` : ''}</dd>` : ''}
+    </dl>
+    <div class="actions">
+      ${r.photo_path ? `<button class="btn sm" data-ract="photo">📷 Token photo</button>` : ''}
+      ${r.proof_path ? `<button class="btn sm" data-ract="proof">📷 Proof</button>` : ''}
+      ${r.status === 'pending' ? (admin
+        ? `<button class="btn sm wa" data-ract="wa" ${vendorPhone ? '' : 'disabled title="Add vendor phone"'}>WhatsApp vendor</button>
+           <button class="btn sm" data-ract="accept">Mark done</button><button class="btn sm danger" data-ract="cancel">Cancel</button>`
+        : `<button class="btn sm good" data-ract="accept">Accept (done)</button><button class="btn sm danger" data-ract="reject">Reject</button>
+           ${S.owner?.phone ? `<button class="btn sm wa" data-ract="ask">${needsDetails ? 'Ask details' : 'Ask owner'}</button>` : ''}`)
+        : (admin && vendorPhone ? `<button class="btn sm wa" data-ract="wa">WhatsApp</button>` : '')}
+    </div>
+  </div>`;
+}
+function bindRequestCards(root) {
+  root.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-ract]'); if (!b) return;
+    const r = S.data.requests.find((x) => x.id === Number(b.closest('[data-req]').dataset.req)); if (!r) return;
+    const act = b.dataset.ract;
+    if (act === 'photo') showPhoto(r.photo_path);
+    if (act === 'proof') showPhoto(r.proof_path);
+    if (act === 'wa') busy(b, () => openWAAsync(prof(r.vendor_id)?.phone, requestMessage(r)));
+    if (act === 'ask') openWA(S.owner.phone, `Hi ${S.owner.name}, about request #${r.id} (${KIND[r.kind]} ${money(r.amount)}${r.method ? `, ${METHOD[r.method]}` : ''}): ${r.method && r.method !== 'cash' && !r.payee_details ? `please send the ${METHOD[r.method]} details.` : ''}`);
+    if (act === 'cancel' && confirm(`Cancel request #${r.id}?`)) busy(b, async () => { must(await sb.rpc('cancel_request', { p_id: r.id })); toast('Cancelled'); scheduleReload(); });
+    if (act === 'accept' || act === 'reject') respondForm(r, act === 'accept');
+  });
+}
+function respondForm(r, accept) {
+  openModal(`${accept ? 'Complete' : 'Reject'} request #${r.id}`, `
+    <form id="resp-form">
+      <p>${KIND[r.kind]} of <b>${money(r.amount)}</b>${r.kind === 'transfer' ? ` from ${esc(accName(acc(r.from_account)))} to ${esc(accName(acc(r.to_account)))}` : ` ${r.kind === 'deposit' ? 'into' : 'from'} ${esc(accName(acc(r.from_account || r.to_account)))}`}.</p>
+      ${accept ? `<p class="muted small">The ID balance${r.kind === 'transfer' ? 's' : ''} will update immediately.</p>
+        <div class="field"><label>Proof photo / screenshot (optional)</label><input type="file" name="proof" accept="image/*"></div>` : ''}
+      <div class="field"><label>Note (optional)</label><input name="note" placeholder="${accept ? 'e.g. done, UTR no.' : 'Reason'}"></div>
+      <button class="btn ${accept ? 'good' : 'danger'} block" type="submit">${accept ? 'Confirm – done' : 'Reject request'}</button>
+    </form>`, (root) => {
+    $('#resp-form', root).onsubmit = (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      busy(e.submitter, async () => {
+        const proof = accept ? await uploadPhoto(fd.get('proof'), r.vendor_id) : null;
+        must(await sb.rpc('respond_request', { p_id: r.id, p_accept: accept, p_note: fd.get('note') || null, p_proof: proof }));
+        modal.close(); toast(accept ? 'Done – balances updated' : 'Rejected'); scheduleReload();
+      });
+    };
+  });
+}
+
+function accountOptions(vendorId, selected) {
+  const list = S.data.accounts.filter((a) => a.status === 'active' && (!vendorId || a.vendor_id === vendorId));
+  return `<option value="">Choose ID…</option>` + list.map((a) =>
+    `<option value="${a.id}" ${a.id === selected ? 'selected' : ''}>${esc(accName(a))} · ${money(a.current_balance)}${vendorId ? '' : ` (${esc(vendorName(a.vendor_id))})`}</option>`).join('');
+}
+function requestForm(pre = {}) {
+  if (!vendors().length) return toast('Create a vendor first', 'error');
+  const vid = pre.vendor || vendors()[0].id;
+  openModal('New request', `
+    <form id="req-form">
+      <div class="field"><div class="seg" id="rk">${Object.entries(KIND).map(([k, l], i) => `<label><input type="radio" name="kind" value="${k}" ${i === 0 ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>
+      <div class="field"><label>Vendor</label><select name="vendor">${vendors().map((p) => `<option value="${p.id}" ${p.id === vid ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="field" data-show="transfer withdrawal"><label>From ID</label><select name="from">${accountOptions(vid, pre.from)}</select></div>
+      <div class="field" data-show="transfer deposit"><label>To ID</label><select name="to">${accountOptions(vid, pre.to)}</select></div>
+      <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+      <div class="field" data-show="deposit withdrawal"><label>Method</label>
+        <select name="method">${Object.entries(METHOD).map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select></div>
+      <div data-show="cash">
+        <div class="fields two">
+          <div class="field"><label data-lbl-person>Person name</label><input name="payee_name"></div>
+          <div class="field"><label>Person phone</label><input name="payee_phone" type="tel" inputmode="tel"></div>
+        </div>
+        <div class="field"><label>Token number</label><input name="token_no"></div>
+        <div class="field"><label>Token / slip photo</label><input name="photo" type="file" accept="image/*"></div>
+      </div>
+      <div class="field" data-show="bank"><label>Bank / UPI details</label>
+        <textarea name="payee_details" placeholder="Name, A/c no, IFSC or UPI id. Leave empty if the vendor should ask you."></textarea></div>
+      <div class="field"><label>Note / instruction</label><input name="note"></div>
+      <label class="row" style="font-weight:500;color:var(--text)"><input type="checkbox" name="send_wa" checked style="width:auto;min-height:0"> Open WhatsApp to send it to the vendor</label>
+      <button class="btn primary block" type="submit" style="margin-top:12px">Create request</button>
+    </form>`, (root) => {
+    const form = $('#req-form', root);
+    const sync = () => {
+      const el = form.elements; const kind = el.kind.value; const method = el.method.value;
+      const showMethod = kind !== 'transfer';
+      root.querySelectorAll('[data-show]').forEach((el) => {
+        const keys = el.dataset.show.split(' ');
+        let show = keys.includes(kind);
+        if (keys.includes('cash')) show = showMethod && method === 'cash';
+        if (keys.includes('bank')) show = showMethod && method !== 'cash';
+        el.classList.toggle('hidden', !show);
+      });
+      $('[data-lbl-person]', root).textContent = kind === 'withdrawal' ? 'Cash to be given to (name)' : 'Person bringing cash (name)';
+    };
+    form.addEventListener('change', (e) => {
+      if (e.target.name === 'vendor') { const el = form.elements; el.from.innerHTML = accountOptions(el.vendor.value); el.to.innerHTML = accountOptions(el.vendor.value); }
+      sync();
+    });
+    sync();
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const f = formObj(form); const kind = f.kind;
+      const cash = kind !== 'transfer' && f.method === 'cash';
+      busy(e.submitter, async () => {
+        const extra = kind === 'transfer' ? {} : {
+          method: f.method,
+          ...(cash ? { payee_name: f.payee_name, payee_phone: f.payee_phone, token_no: f.token_no } : { payee_details: f.payee_details }),
+        };
+        if (cash) extra.photo_path = await uploadPhoto(form.elements.photo.files[0], f.vendor);
+        const id = must(await sb.rpc('create_request', {
+          p_kind: kind, p_from: kind === 'deposit' ? null : f.from || null, p_to: kind === 'withdrawal' ? null : f.to || null,
+          p_amount: Number(f.amount), p_note: f.note || null, p_extra: extra,
+        }));
+        modal.close(); toast(`Request #${id} created`);
+        await loadData(); renderView();
+        const r = S.data.requests.find((x) => x.id === id);
+        const phone = prof(f.vendor)?.phone;
+        if (f.send_wa && r) {
+          if (!phone) toast('Vendor has no phone number – add it in Vendors', 'error');
+          else { const text = await requestMessage(r); openModal('Send on WhatsApp', `<p>Request #${id} is ready to send to ${esc(vendorName(f.vendor))}.</p><a class="btn wa block" href="${esc(waUrl(phone, text))}" target="_blank" rel="noopener">Open WhatsApp</a>`); }
+        }
+      });
+    };
+  });
+}
+
+// ============================================================
+// P&L (owner only) — daily sheet
+// ============================================================
+function viewPnl(v) {
+  if (!isAdmin()) return viewIds(v);
+  const day = S.f.pnlDate || settleDay();
+  const ids = S.data.accounts.filter((a) => a.status === 'active' || S.data.pnl.some((p) => p.account_id === a.id && p.settle_date === day))
+    .sort((a, b) => vendorName(a.vendor_id).localeCompare(vendorName(b.vendor_id)) || accName(a).localeCompare(accName(b)));
+  const dayEntries = S.data.pnl.filter((p) => p.settle_date === day);
+  const net = (id) => sum(dayEntries.filter((p) => p.account_id === id), (p) => p.amount);
+  const total = sum(dayEntries, (p) => p.amount);
+  const comm = sum(commissionPreview(day), (c) => c.commission);
+  v.innerHTML = `
+    <div class="section-head"><h2>Profit & loss</h2></div>
+    <div class="toolbar">
+      <div><label for="pnl-date">Settlement day (11 AM → 11 AM)</label><input type="date" id="pnl-date" value="${day}"></div>
+    </div>
+    <div class="kpis section">
+      ${kpi('Day P&L', signed(total), fmtD(day))}
+      ${kpi('Commission on losses', money(comm), day === settleDay() ? 'Running – settles at 11 AM' : '')}
+    </div>
+    <p class="muted small">Type a number for each ID: <b>positive = profit</b>, <b>negative = loss</b> (e.g. −2000). Saving adds it to that day and updates the ID balance. You can add more than once a day.</p>
+    ${ids.length ? `<form id="pnl-form"><div class="table-wrap"><table>
+      <thead><tr><th>ID</th><th class="r">Day so far</th><th class="r">Add ±</th></tr></thead>
+      <tbody>${ids.map((a) => `<tr><td style="white-space:normal"><b>${esc(accName(a))}</b><div class="muted small">${esc(vendorName(a.vendor_id))} · ${money(a.current_balance)}</div></td>
+        <td class="r">${signed(net(a.id))}</td><td class="r"><input class="pnl-input" name="${a.id}" type="text" inputmode="text" placeholder="±0" aria-label="P&L for ${esc(accName(a))}"></td></tr>`).join('')}</tbody>
+    </table></div>
+    <div class="field" style="margin-top:12px"><label>Note (optional, applies to all rows)</label><input name="__note"></div>
+    <button class="btn primary block" type="submit">Save P&L</button></form>` : '<div class="empty">No IDs yet</div>'}
+    <div class="section" style="margin-top:20px">
+      <div class="section-head"><h2>Entries on ${fmtD(day)}</h2></div>
+      <div class="list">${dayEntries.length ? dayEntries.map((p) => `<div class="item row between">
+        <div><b>${esc(accName(acc(p.account_id)))}</b> <span class="muted small">${esc(vendorName(acc(p.account_id)?.vendor_id))} · ${fmtDT(p.created_at)}${p.note ? ` · ${esc(p.note)}` : ''}</span></div>
+        <div class="row">${signed(Number(p.amount))}<button class="icon-btn" data-del-pnl="${p.id}" title="Delete">🗑</button></div></div>`).join('') : '<div class="empty">No entries for this day</div>'}</div>
+    </div>`;
+  $('#pnl-date').onchange = (e) => { S.f.pnlDate = e.target.value || null; renderView(); };
+  $('#pnl-form')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const f = formObj(e.target);
+    const rows = []; const bad = [];
+    for (const [k, val] of Object.entries(f)) {
+      if (k === '__note' || !String(val).trim()) continue;
+      const n = Number(String(val).replace(/[,\s₹]/g, '').replace('−', '-'));
+      if (!Number.isFinite(n)) bad.push(accName(acc(k)));
+      else if (n !== 0) rows.push({ account_id: k, settle_date: day, amount: n, note: f.__note || null });
+    }
+    if (bad.length) return toast(`Not a number: ${bad.join(', ')}`, 'error');
+    if (!rows.length) return toast('Enter at least one amount', 'error');
+    busy(e.submitter, async () => { must(await sb.from('pnl_entries').insert(rows)); e.target.reset(); toast(`Saved ${rows.length} entr${rows.length > 1 ? 'ies' : 'y'}`); scheduleReload(); });
+  });
+  v.querySelectorAll('[data-del-pnl]').forEach((b) => b.onclick = () => {
+    if (!confirm('Delete this P&L entry? The ID balance will be reversed.')) return;
+    busy(b, async () => { must(await sb.from('pnl_entries').delete().eq('id', b.dataset.delPnl)); toast('Deleted'); scheduleReload(); });
+  });
+}
+function pnlQuick(a) {
+  const day = settleDay();
+  openModal(`P&L · ${accName(a)}`, `
+    <form id="pq">
+      <div class="field"><div class="seg"><label><input type="radio" name="t" value="1" checked><span>Profit</span></label><label><input type="radio" name="t" value="-1"><span>Loss</span></label></div></div>
+      <div class="fields two">
+        <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+        <div class="field"><label>Settlement day</label><input name="day" type="date" value="${day}" required></div>
+      </div>
+      <div class="field"><label>Note</label><input name="note"></div>
+      <button class="btn primary block">Save</button>
+    </form>`, (root) => {
+    $('#pq', root).onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(e.target);
+      busy(e.submitter, async () => {
+        must(await sb.from('pnl_entries').insert({ account_id: a.id, settle_date: f.day, amount: Number(f.amount) * Number(f.t), note: f.note || null }));
+        modal.close(); toast('P&L saved'); scheduleReload();
+      });
+    };
+  });
+}
+
+// ============================================================
+// COMMISSION
+// ============================================================
+function viewCommission(v) {
+  const admin = isAdmin();
+  const cur = settleDay();
+  const sets = S.data.settlements;
+  const due = sets.filter((s) => s.status === 'due');
+  const byDate = {};
+  sets.forEach((s) => (byDate[s.settle_date] ||= []).push(s));
+  const dates = Object.keys(byDate).sort().reverse();
+  const preview = admin ? commissionPreview(cur).filter((c) => c.commission > 0) : [];
+  const comDate = S.f.comDate || addDays(cur, -1);
+
+  v.innerHTML = `
+    <div class="section-head"><h2>Commission</h2></div>
+    <p class="muted small">Commission = loss of the day × the ID's commission %. The day runs 11:00 AM → 11:00 AM and settles at 11:00 AM.</p>
+    <div class="kpis section">
+      ${kpi('Due (not received)', money(sum(due, (s) => s.commission)), `${due.length} entries`)}
+      ${kpi('Received', money(sum(sets.filter((s) => s.status === 'received'), (s) => s.commission)), 'All time')}
+      ${admin ? kpi('Running today', money(sum(preview, (c) => c.commission)), fmtD(cur)) : ''}
+    </div>
+    ${admin ? `<div class="card section">
+      <h3 style="margin-bottom:8px">Settle a day</h3>
+      <div class="row"><input type="date" id="com-date" value="${comDate}" style="flex:1 1 160px;width:auto"><button class="btn primary" id="run-settle">Run settlement</button></div>
+      <p class="muted small" style="margin:8px 0 0">Runs automatically at 11:00 AM if auto-settlement is switched on (see README). Running again re-calculates rows that are still due.</p>
+    </div>
+    ${preview.length ? `<div class="section"><div class="section-head"><h2>Running today (${fmtD(cur)})</h2></div>${commTable(preview.map((c) => ({ ...c, net_pnl: c.net, commission_pct: c.pct, status: 'running' })), false)}</div>` : ''}` : ''}
+    ${dates.length ? dates.map((d) => `<div class="section"><div class="section-head"><h2>${fmtD(d)}</h2>
+        <span class="muted small">Total ${money(sum(byDate[d], (s) => s.commission))}</span></div>${commTable(byDate[d], admin)}</div>`).join('')
+      : '<div class="empty">No settled commission yet</div>'}`;
+  if (admin) {
+    $('#com-date').onchange = (e) => { S.f.comDate = e.target.value; };
+    $('#run-settle').onclick = (e) => busy(e.target, async () => {
+      const d = $('#com-date').value; if (!d) return;
+      const n = must(await sb.rpc('run_settlement', { p_date: d }));
+      toast(`Settled ${fmtD(d)}: ${n} ID${n === 1 ? '' : 's'} with commission`); scheduleReload();
+    });
+    v.querySelectorAll('[data-recv]').forEach((b) => b.onclick = () => busy(b, async () => {
+      const recv = b.dataset.to === 'received';
+      must(await sb.from('settlements').update({ status: recv ? 'received' : 'due', received_at: recv ? new Date().toISOString() : null }).eq('id', b.dataset.recv));
+      scheduleReload();
+    }));
+  }
+}
+function commTable(rows, actions) {
+  return `<div class="table-wrap"><table><thead><tr><th>ID</th>${isAdmin() ? '<th>Vendor</th>' : ''}<th class="r">Day loss</th><th class="r">%</th><th class="r">Commission</th><th>Status</th>${actions ? '<th></th>' : ''}</tr></thead><tbody>
+    ${rows.map((s) => `<tr><td>${esc(accName(acc(s.account_id)))}</td>${isAdmin() ? `<td>${esc(vendorName(s.vendor_id))}</td>` : ''}
+      <td class="r">${signed(Number(s.net_pnl))}</td><td class="r">${Number(s.commission_pct)}%</td><td class="r num"><b>${money(s.commission)}</b></td>
+      <td><span class="pill ${s.status}">${s.status}</span></td>
+      ${actions ? `<td>${s.status === 'due' ? `<button class="btn sm" data-recv="${s.id}" data-to="received">Mark received</button>` : `<button class="btn sm" data-recv="${s.id}" data-to="due">Undo</button>`}</td>` : ''}</tr>`).join('')}
+  </tbody></table></div>`;
+}
+
+// ============================================================
+// PAYMENT LEDGER (owner only)
+// ============================================================
+function viewLedger(v) {
+  if (!isAdmin()) return viewIds(v);
+  const rows = S.data.ledger.filter((l) => !S.f.ledVendor || (S.f.ledVendor === 'none' ? !l.vendor_id : l.vendor_id === S.f.ledVendor));
+  const paid = sum(rows.filter((l) => l.direction === 'out'), (l) => l.amount);
+  const recv = sum(rows.filter((l) => l.direction === 'in'), (l) => l.amount);
+  v.innerHTML = `
+    <div class="section-head"><h2>Payment ledger</h2><button class="btn primary" id="add-led">+ Add payment</button></div>
+    <div class="toolbar"><select id="led-vendor"><option value="">All vendors</option><option value="none" ${S.f.ledVendor === 'none' ? 'selected' : ''}>No vendor</option>${vendors().map((p) => `<option value="${p.id}" ${S.f.ledVendor === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+    <div class="kpis section">
+      ${kpi('Paid out', money(paid))}${kpi('Received', money(recv))}${kpi('Net', signed(recv - paid), 'Received − paid')}${kpi('Entries', rows.length)}
+    </div>
+    ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Vendor</th><th>Type</th><th>Mode</th><th class="r">Amount</th><th>Ref / note</th><th></th></tr></thead><tbody>
+      ${rows.map((l) => `<tr><td>${fmtD(l.entry_date)}</td><td>${esc(l.vendor_id ? vendorName(l.vendor_id) : '—')}</td>
+        <td>${l.direction === 'out' ? '<span class="neg">Paid</span>' : '<span class="pos">Received</span>'}</td><td>${esc(l.mode)}</td>
+        <td class="r">${signed(l.direction === 'out' ? -l.amount : +l.amount)}</td><td>${esc([l.reference, l.note].filter(Boolean).join(' · '))}</td>
+        <td><button class="icon-btn" data-del-led="${l.id}" title="Delete">🗑</button></td></tr>`).join('')}
+    </tbody></table></div>` : '<div class="empty">No payments recorded</div>'}`;
+  $('#led-vendor').onchange = (e) => { S.f.ledVendor = e.target.value; renderView(); };
+  $('#add-led').onclick = ledgerForm;
+  v.querySelectorAll('[data-del-led]').forEach((b) => b.onclick = () => {
+    if (!confirm('Delete this payment entry?')) return;
+    busy(b, async () => { must(await sb.from('ledger').delete().eq('id', b.dataset.delLed)); toast('Deleted'); scheduleReload(); });
+  });
+}
+function ledgerForm() {
+  openModal('Add payment', `
+    <form id="led-form">
+      <div class="field"><div class="seg"><label><input type="radio" name="direction" value="out" checked><span>I paid</span></label><label><input type="radio" name="direction" value="in"><span>I received</span></label></div></div>
+      <div class="fields two">
+        <div class="field"><label>Date</label><input name="entry_date" type="date" value="${todayIST()}" required></div>
+        <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+        <div class="field"><label>Vendor</label><select name="vendor_id"><option value="">— None —</option>${vendors().map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>Mode</label><select name="mode">${LEDGER_MODES.map((m) => `<option>${m}</option>`).join('')}</select></div>
+      </div>
+      <div class="field"><label>Reference (UTR / token)</label><input name="reference"></div>
+      <div class="field"><label>Note</label><input name="note"></div>
+      <button class="btn primary block">Save</button>
+    </form>`, (root) => {
+    $('#led-form', root).onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(e.target);
+      busy(e.submitter, async () => {
+        must(await sb.from('ledger').insert({ ...f, amount: Number(f.amount), vendor_id: f.vendor_id || null, reference: f.reference || null, note: f.note || null }));
+        modal.close(); toast('Payment saved'); scheduleReload();
+      });
+    };
+  });
+}
+
+// ============================================================
+// VENDORS (owner only)
+// ============================================================
+function viewVendors(v) {
+  if (!isAdmin()) return viewIds(v);
+  v.innerHTML = `
+    <div class="section-head"><h2>Vendors</h2><button class="btn primary" id="add-vendor">+ Create vendor</button></div>
+    <div class="list section">${vendors().length ? vendors().map((p) => { const s = vendorStats(p.id); return `<div class="item" data-vid="${p.id}">
+      <div class="row between"><div><h3>${esc(p.name)}</h3><div class="muted small">Login: <span class="secret">${esc(p.username)}</span>${p.phone ? ` · ${esc(p.phone)}` : ''}</div></div>
+        <span class="pill ${p.active ? 'active' : 'closed'}">${p.active ? 'active' : 'off'}</span></div>
+      <div class="small" style="margin-top:6px">${s.count} IDs · Balance ${money(s.balance)} · Pending ${s.pending.length} · Comm. due ${money(s.commDue)}</div>
+      <div class="actions">
+        <button class="btn sm wa" data-vact="wa" ${p.phone ? '' : 'disabled'}>${s.pending.length ? 'Remind pending' : 'WhatsApp'}</button>
+        <button class="btn sm" data-vact="edit">Edit</button>
+        <button class="btn sm" data-vact="pw">Reset password</button>
+        <button class="btn sm ${p.active ? 'danger' : ''}" data-vact="toggle">${p.active ? 'Deactivate' : 'Activate'}</button>
+      </div></div>`; }).join('') : '<div class="empty">No vendors yet</div>'}</div>
+    <div class="card">
+      <h3 style="margin-bottom:8px">My details</h3>
+      <form id="me-form" class="row">
+        <input name="name" value="${esc(S.me.name)}" placeholder="Name" style="flex:1 1 140px;width:auto" required>
+        <input name="phone" value="${esc(S.me.phone)}" placeholder="WhatsApp no. e.g. 9198…" type="tel" style="flex:1 1 160px;width:auto">
+        <button class="btn">Save</button>
+      </form>
+      <p class="muted small" style="margin:8px 0 0">Vendors use this number for the “WhatsApp owner” button.</p>
+    </div>`;
+  $('#add-vendor').onclick = () => vendorForm();
+  $('#me-form').onsubmit = (e) => {
+    e.preventDefault(); const f = formObj(e.target);
+    busy(e.submitter, async () => { must(await sb.from('profiles').update({ name: f.name.trim(), phone: f.phone.trim() || null }).eq('id', S.me.id)); toast('Saved'); scheduleReload(); });
+  };
+  v.querySelectorAll('[data-vact]').forEach((b) => b.onclick = () => {
+    const p = prof(b.closest('[data-vid]').dataset.vid);
+    const act = b.dataset.vact;
+    if (act === 'wa') openWA(p.phone, reminderMessage(p.id));
+    if (act === 'edit') vendorForm(p);
+    if (act === 'pw') {
+      const pw = prompt(`New password for ${p.name} (min 6 characters):`);
+      if (!pw) return;
+      busy(b, async () => { must(await sb.rpc('admin_set_password', { p_user: p.id, p_password: pw })); credentialsModal(p, pw, 'Password changed'); });
+    }
+    if (act === 'toggle' && confirm(`${p.active ? 'Deactivate' : 'Activate'} ${p.name}?`))
+      busy(b, async () => { must(await sb.rpc('admin_set_active', { p_user: p.id, p_active: !p.active })); toast('Updated'); scheduleReload(); });
+  });
+}
+function vendorForm(p = null) {
+  openModal(p ? 'Edit vendor' : 'Create vendor', `
+    <form id="v-form">
+      <div class="field"><label>Name</label><input name="name" value="${esc(p?.name)}" required></div>
+      <div class="field"><label>WhatsApp number</label><input name="phone" type="tel" value="${esc(p?.phone)}" placeholder="10-digit or with country code"></div>
+      ${p ? '' : `<div class="fields two">
+        <div class="field"><label>Login username</label><input name="username" required autocapitalize="none" pattern="[A-Za-z0-9._\\-]{3,30}" title="3–30 letters, numbers, . _ -"></div>
+        <div class="field"><label>Password</label><input name="password" required minlength="6" value="${Math.random().toString(36).slice(2, 10)}"></div></div>`}
+      <button class="btn primary block">${p ? 'Save' : 'Create vendor'}</button>
+    </form>`, (root) => {
+    $('#v-form', root).onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(e.target);
+      busy(e.submitter, async () => {
+        if (p) {
+          must(await sb.from('profiles').update({ name: f.name.trim(), phone: f.phone.trim() || null }).eq('id', p.id));
+          modal.close(); toast('Saved');
+        } else {
+          must(await sb.rpc('admin_create_vendor', { p_username: f.username, p_password: f.password, p_name: f.name, p_phone: f.phone || null }));
+          credentialsModal({ name: f.name.trim(), username: f.username.trim().toLowerCase(), phone: f.phone }, f.password, 'Vendor created');
+        }
+        scheduleReload();
+      });
+    };
+  });
+}
+function credentialsModal(p, pw, title) {
+  const text = `Hi ${p.name}, your login for the ID Ledger app:\n\nLink: ${APP_URL}\nUsername: ${p.username}\nPassword: ${pw}\n\nAdd the IDs you give me there and accept my transfer / deposit / withdrawal requests once done.`;
+  openModal(title, `
+    <dl class="kv" style="margin-bottom:14px"><dt>Link</dt><dd>${esc(APP_URL)}</dd><dt>Username</dt><dd class="secret">${esc(p.username)}</dd><dt>Password</dt><dd class="secret">${esc(pw)}</dd></dl>
+    <div class="stack">
+      ${p.phone ? `<a class="btn wa block" href="${esc(waUrl(p.phone, text))}" target="_blank" rel="noopener">Send login on WhatsApp</a>` : ''}
+      <button class="btn block" id="copy-cred">Copy login details</button>
+    </div>`, (root) => { $('#copy-cred', root).onclick = () => copy(text, 'Login details copied'); });
+}
