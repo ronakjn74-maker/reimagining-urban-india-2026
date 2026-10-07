@@ -1181,7 +1181,7 @@ function viewInvestors(v) {
     </div>
     <div class="kpis section">
       ${kpi(admin ? 'Amount due today' : 'Due to you today', money(tot.due), lastDate ? `Prices of ${fmtD(lastDate)}${change != null ? ` · ${change >= 0 ? '+' : ''}${money(change)} vs previous day` : ''}` : 'No prices yet')}
-      ${kpi(admin ? 'Money he gave' : 'Money you gave', money(tot.received), 'Shares × sell rate')}
+      ${kpi(admin ? 'Shares sold value' : 'Your shares sold value', money(tot.received), 'Shares × sell rate')}
       ${kpi('Returned so far', money(tot.returned), 'Shares + cash')}
       ${kpi('Market move on shares still owed', signed(tot.due - tot.owedAtSellRate), 'Today’s value − value at sell rate')}
     </div>
@@ -1197,16 +1197,16 @@ function viewInvestors(v) {
         <button class="btn sm primary" id="inv-money-in">${L.addIn}</button>
         ${admin ? `<button class="btn sm" id="inv-money-out">${L.addOut}</button>` : ''}</div>
       <div class="kpis section">
-        ${kpi(L.in, signed(totIn), `Shares ${money(byKind('shares'))} · Cash ${money(byKind('cash'))} · Other ${money(byKind('other'))}`)}
+        ${kpi(admin ? 'Money for shares received' : 'Money for shares sent', signed(byKind('shares')), `Shares sold value ${money(tot.received)}`)}
+        ${(() => { const diff = tot.received - byKind('shares'); return diff >= 0
+          ? kpi(admin ? 'Shares money still to receive' : 'Shares money still to send', `<span class="neg">${money(diff)}</span>`, 'Shares sold value − money for shares')
+          : kpi(admin ? 'Received more for shares' : 'Sent more for shares', `<span class="pos">${money(-diff)}</span>`, `More than the shares' value`); })()}
+        ${kpi('Cash / other settlement', signed(byKind('cash') + byKind('other')), admin ? 'Received separately – not for shares' : 'Sent separately – not for shares')}
         ${kpi(L.out, signed(-totOut), `${cashOut.length} payment${cashOut.length === 1 ? '' : 's'}`)}
-        ${kpi('Net', signed(totIn - totOut), admin ? 'Received − paid' : 'Sent − received back')}
-        ${(() => { const diff = tot.received - totIn; return diff >= 0
-          ? kpi(admin ? 'Still to receive from him' : 'Still to send', money(diff), `Shares sold ${money(tot.received)} − all money ${admin ? 'received' : 'sent'}`)
-          : kpi(admin ? 'Received more' : 'Sent more', `<span class="pos">${money(-diff)}</span>`, `More than the shares' value ${money(tot.received)}`); })()}
       </div>
       ${moneyRows.length ? `<div class="list">${moneyRows.map((m) => `<div class="item row between">
         <div><b class="${m.kind === 'in' ? 'pos' : 'neg'}">${m.kind === 'in' ? L.in : L.out}</b>
-          ${m.kind === 'in' ? `<span class="pill kind">${{ shares: `Shares · ${qtyFmt(m.x.qty)} ${esc(m.x.symbol)}`, cash: 'Cash', other: 'Other settlement' }[m.x.kind || 'cash']}</span>` : ''}
+          ${m.kind === 'in' ? `<span class="pill kind">${m.x.kind === 'shares' ? (m.x.symbol ? `Shares · ${qtyFmt(m.x.qty)} ${esc(m.x.symbol)}` : 'Shares') : 'Cash / other settlement'}</span>` : ''}
           <div class="muted small">${fmtD(m.date)}${m.x.mode && m.kind === 'in' ? ` · ${esc(m.x.mode)}` : ''}${m.x.payment_mode && m.kind === 'out' ? ` · ${esc(m.x.payment_mode)}` : ''}${m.kind === 'out' ? ` · counts as ${qtyFmt(m.x.qty)} ${esc(m.x.symbol)} @ ${money(m.x.rate)}` : ''}${m.x.reference ? ` · ${esc(m.x.reference)}` : ''}${m.x.note ? ` · ${esc(m.x.note)}` : ''}${admin && m.kind === 'in' && m.x.created_by === inv.id ? ` · <span class="pill pending">added by ${esc(inv.name)}</span>` : ''}</div></div>
         <div class="row">${signed(m.kind === 'in' ? m.amount : -m.amount)}
           ${m.kind === 'in' && (admin || m.x.created_by === S.me.id) ? `<button class="icon-btn" data-del-money="${m.x.id}" title="Delete">🗑</button>` : ''}</div></div>`).join('')}</div>` : '<div class="empty">No money entries yet</div>'}
@@ -1335,12 +1335,11 @@ function moneyForm(inv) {
   openModal(admin ? `Money received from ${inv.name}` : 'Money I sent', `
     <form id="money-form">
       <div class="field"><label>Type</label><div class="seg">
-        <label><input type="radio" name="kind" value="shares" ${left.length ? 'checked' : 'disabled'}><span>Shares</span></label>
-        <label><input type="radio" name="kind" value="cash" ${left.length ? '' : 'checked'}><span>Cash</span></label>
-        <label><input type="radio" name="kind" value="other"><span>Other settlement</span></label></div></div>
+        <label><input type="radio" name="kind" value="shares" checked><span>Shares</span></label>
+        <label><input type="radio" name="kind" value="cash"><span>Cash / other settlement</span></label></div></div>
       <div data-k="shares">
-        <div class="field"><label>Share sold for this money</label><select name="stock">${left.map((r) => `<option value="${esc(stockKey(r))}">${esc(r.symbol)} (${r.exchange}) – ${qtyFmt(r.leftQty)} left @ ${money(r.avgRate)}</option>`).join('')}</select></div>
-        <div class="field"><label>Shares sold (quantity)</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal"></div>
+        <div class="field"><label>Share sold for this money</label><select name="stock"><option value="">All shares (not one stock)</option>${left.map((r) => `<option value="${esc(stockKey(r))}">${esc(r.symbol)} (${r.exchange}) – ${qtyFmt(r.leftQty)} left @ ${money(r.avgRate)}</option>`).join('')}</select></div>
+        <div class="field" data-qty><label>Shares sold (quantity)</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal"></div>
       </div>
       <div class="fields two">
         <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
@@ -1359,19 +1358,19 @@ function moneyForm(inv) {
     const sync = (e) => {
       const shares = el.kind.value === 'shares';
       $('[data-k="shares"]', root).classList.toggle('hidden', !shares);
-      el.qty.required = shares;
       const r = cur(); const q = Number(el.qty.value || 0);
+      el.qty.required = shares && !!r; $('[data-qty]', root).classList.toggle('hidden', !r);
       if (shares && r && !amountTouched && e?.target !== el.amount) el.amount.value = q ? (Math.round(q * r.avgRate * 100) / 100) : '';
       $('#money-calc', root).innerHTML = shares && r
         ? `${esc(r.symbol)}: ${qtyFmt(r.leftQty)} left → after this <b>${qtyFmt(Math.max(0, Math.round((r.leftQty - q) * 10000) / 10000))}</b> left`
-        : el.kind.value === 'cash' ? 'Cash given directly (not from selling shares).' : 'Any other settlement – recorded only.';
+        : shares ? 'Money for his shares – reduces “shares money still to receive”.' : 'Cash or any other settlement – kept separate, does not count for shares.';
     };
     form.addEventListener('input', sync); form.addEventListener('change', sync); sync();
     form.onsubmit = (e) => {
       e.preventDefault(); const f = formObj(form); const r = cur();
       const row = { investor_id: inv.id, kind: f.kind, amount: Number(f.amount), paid_on: f.paid_on, mode: f.mode,
         reference: f.reference.trim() || null, note: f.note.trim() || null };
-      if (f.kind === 'shares') { if (!r) return toast('Choose the share', 'error'); Object.assign(row, { symbol: r.symbol, exchange: r.exchange, qty: Number(f.qty) }); }
+      if (f.kind === 'shares' && r) Object.assign(row, { symbol: r.symbol, exchange: r.exchange, qty: Number(f.qty) });
       busy(e.submitter, async () => {
         must(await sb.from('investor_money').insert(row));
         modal.close(); toast('Saved'); scheduleReload();

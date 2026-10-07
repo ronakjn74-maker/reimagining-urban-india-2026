@@ -545,12 +545,14 @@ create or replace function public.investor_money_check() returns trigger
 language plpgsql security definer set search_path = public as $$
 declare listed numeric; sent numeric;
 begin
-  if new.kind <> 'shares' then
+  new.symbol := nullif(upper(trim(new.symbol)), '');
+  -- cash / other settlement, or shares money not tied to one stock
+  if new.kind <> 'shares' or new.symbol is null then
     new.symbol := null; new.exchange := null; new.qty := null;
     return new;
   end if;
-  new.symbol := upper(trim(new.symbol)); new.exchange := coalesce(new.exchange, 'NSE');
-  if new.symbol is null or coalesce(new.qty, 0) <= 0 then raise exception 'Choose the share and how many were sold'; end if;
+  new.exchange := coalesce(new.exchange, 'NSE');
+  if coalesce(new.qty, 0) <= 0 then raise exception 'Enter how many shares were sold'; end if;
   select coalesce(sum(qty), 0) into listed from investor_stocks
    where investor_id = new.investor_id and symbol = new.symbol and exchange = new.exchange;
   select coalesce(sum(qty), 0) into sent from investor_money
