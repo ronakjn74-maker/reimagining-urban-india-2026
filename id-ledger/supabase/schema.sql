@@ -21,7 +21,7 @@ create table public.profiles (
   username    text not null unique,
   name        text not null,
   phone       text,
-  role        text not null default 'vendor' check (role in ('admin','vendor')),
+  role        text not null default 'vendor' check (role in ('admin','vendor','investor')),
   active      boolean not null default true,
   created_at  timestamptz not null default now()
 );
@@ -417,6 +417,147 @@ create table public.ledger (
 );
 
 -- ---------------------------------------------------------------------
+-- Investors (e.g. Sanjay): shares they sold to fund the business.
+-- You owe them the SHARES back, so the amount due each day is
+--   shares still owed × that day's closing price.
+-- Returns: give shares back, or pay cash (counted as shares at that day's price).
+-- ---------------------------------------------------------------------
+create table public.investor_stocks (
+  id           bigint generated always as identity primary key,
+  investor_id  uuid not null references public.profiles(id) on delete cascade,
+  symbol       text not null,                       -- ticker, e.g. RELIANCE
+  exchange     text not null default 'NSE' check (exchange in ('NSE','BSE')),
+  stock_name   text,
+  qty          numeric(14,4) not null check (qty > 0),
+  sell_rate    numeric(14,2) not null check (sell_rate > 0),
+  sold_on      date not null default ((now() at time zone 'Asia/Kolkata')::date),
+  note         text,
+  created_at   timestamptz not null default now()
+);
+create index on public.investor_stocks (investor_id);
+
+create table public.investor_returns (
+  id            bigint generated always as identity primary key,
+  investor_id   uuid not null references public.profiles(id) on delete cascade,
+  symbol        text not null,
+  exchange      text not null default 'NSE' check (exchange in ('NSE','BSE')),
+  mode          text not null check (mode in ('shares','cash')),
+  qty           numeric(14,4) not null,              -- shares returned (cash: equivalent shares)
+  rate          numeric(14,2) not null check (rate > 0),  -- price used
+  amount        numeric(14,2) not null,              -- value (cash: amount paid)
+  paid_on       date not null default ((now() at time zone 'Asia/Kolkata')::date),
+  payment_mode  text,
+  reference     text,
+  note          text,
+  created_at    timestamptz not null default now()
+);
+create index on public.investor_returns (investor_id);
+
+create or replace function public.investor_returns_check() returns trigger
+language plpgsql set search_path = public as $$
+declare owed numeric;
+begin
+  new.symbol := upper(trim(new.symbol));
+  if new.mode = 'cash' then
+    if coalesce(new.amount, 0) <= 0 then raise exception 'Enter the amount paid'; end if;
+    new.qty := round(new.amount / new.rate, 4);
+  else
+    if coalesce(new.qty, 0) <= 0 then raise exception 'Enter the number of shares'; end if;
+    new.amount := round(new.qty * new.rate, 2);
+  end if;
+  select coalesce((select sum(qty) from investor_stocks where investor_id = new.investor_id and symbol = new.symbol and exchange = new.exchange), 0)
+       - coalesce((select sum(qty) from investor_returns where investor_id = new.investor_id and symbol = new.symbol and exchange = new.exchange
+                    and id is distinct from new.id), 0)
+    into owed;
+  if new.qty > owed + 0.0001 then
+    raise exception 'That is more than the % % shares still owed', trim(to_char(owed, 'FM999999990.####')), new.symbol;
+  end if;
+  return new;
+end $$;
+create trigger investor_returns_check before insert or update on public.investor_returns
+  for each row execute function public.investor_returns_check();
+
+create or replace function public.investor_stocks_norm() returns trigger
+language plpgsql as $$
+begin new.symbol := upper(trim(new.symbol)); return new; end $$;
+create trigger investor_stocks_norm before insert or update on public.investor_stocks
+  for each row execute function public.investor_stocks_norm();
+
+-- Daily closing prices (filled automatically; owner can type a price, which is never overwritten).
+create table public.stock_prices (
+  symbol      text not null,
+  exchange    text not null default 'NSE' check (exchange in ('NSE','BSE')),
+  price_date  date not null,
+  close       numeric(14,2) not null check (close > 0),
+  source      text not null default 'auto' check (source in ('auto','manual')),
+  updated_at  timestamptz not null default now(),
+  primary key (symbol, exchange, price_date)
+);
+
+-- Automatic prices use the pg_net extension (enabled by automation.sql) and Yahoo Finance.
+create table public.price_fetch_jobs (
+  request_id  bigint primary key,
+  symbol      text not null,
+  exchange    text not null,
+  created_at  timestamptz not null default now()
+);
+
+create or replace function public.queue_price_fetch() returns integer
+language plpgsql security definer set search_path = public as $$
+declare r record; n integer := 0; rid bigint;
+begin
+  if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
+  if not exists (select 1 from pg_extension where extname = 'pg_net') then
+    raise exception 'Automatic prices are off – run automation.sql in Supabase once';
+  end if;
+  for r in
+    select s.symbol, s.exchange
+      from investor_stocks s
+     group by s.symbol, s.exchange
+    having sum(s.qty) > coalesce((select sum(x.qty) from investor_returns x where x.symbol = s.symbol and x.exchange = s.exchange), 0)
+  loop
+    execute 'select net.http_get(url := $1, headers := $2)' into rid
+      using 'https://query1.finance.yahoo.com/v8/finance/chart/' || r.symbol
+            || case when r.exchange = 'BSE' then '.BO' else '.NS' end || '?range=1d&interval=1d',
+            '{"User-Agent":"Mozilla/5.0"}'::jsonb;
+    insert into price_fetch_jobs (request_id, symbol, exchange) values (rid, r.symbol, r.exchange);
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+
+create or replace function public.collect_prices() returns integer
+language plpgsql security definer set search_path = public as $$
+declare j record; body jsonb; px numeric; ts bigint; n integer := 0;
+begin
+  if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
+  for j in execute
+    'select f.request_id, f.symbol, f.exchange, r.status_code, r.content
+       from price_fetch_jobs f join net._http_response r on r.id = f.request_id'
+  loop
+    begin
+      if j.status_code = 200 then
+        body := j.content::jsonb -> 'chart' -> 'result' -> 0 -> 'meta';
+        px := (body ->> 'regularMarketPrice')::numeric;
+        ts := (body ->> 'regularMarketTime')::bigint;
+        if px > 0 and ts is not null then
+          insert into stock_prices (symbol, exchange, price_date, close, source)
+          values (j.symbol, j.exchange, (to_timestamp(ts) at time zone 'Asia/Kolkata')::date, round(px, 2), 'auto')
+          on conflict (symbol, exchange, price_date) do update
+            set close = excluded.close, updated_at = now()
+            where stock_prices.source = 'auto';
+          n := n + 1;
+        end if;
+      end if;
+    exception when others then null;  -- skip a bad response, keep the rest
+    end;
+    delete from price_fetch_jobs where request_id = j.request_id;
+  end loop;
+  delete from price_fetch_jobs where created_at < now() - interval '1 day';
+  return n;
+end $$;
+
+-- ---------------------------------------------------------------------
 -- Vendor management (owner only). Vendors log in with a username.
 -- Username "ravi" becomes the login email "ravi@ledger.local" behind the scenes.
 -- ---------------------------------------------------------------------
@@ -460,6 +601,13 @@ begin
   return _create_login(p_username, p_password, p_name, p_phone, 'vendor');
 end $$;
 
+create or replace function public.admin_create_investor(p_username text, p_password text, p_name text, p_phone text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'Only the owner can create investors'; end if;
+  return _create_login(p_username, p_password, p_name, p_phone, 'investor');
+end $$;
+
 create or replace function public.admin_set_password(p_user uuid, p_password text) returns void
 language plpgsql security definer set search_path = public, extensions, auth as $$
 begin
@@ -501,6 +649,10 @@ alter table public.pnl_entries enable row level security;
 alter table public.settlements enable row level security;
 alter table public.ledger      enable row level security;
 alter table public.bets        enable row level security;
+alter table public.investor_stocks  enable row level security;
+alter table public.investor_returns enable row level security;
+alter table public.stock_prices     enable row level security;
+alter table public.price_fetch_jobs enable row level security;
 
 create policy profiles_read   on public.profiles for select using (is_admin() or id = auth.uid());
 create policy profiles_update on public.profiles for update using (is_admin()) with check (is_admin());
@@ -527,6 +679,17 @@ create policy settlements_admin on public.settlements for update using (is_admin
 create policy ledger_admin on public.ledger for all using (is_admin()) with check (is_admin());
 create policy bets_admin   on public.bets   for all using (is_admin()) with check (is_admin());
 
+create policy inv_stocks_read  on public.investor_stocks for select
+  using (is_admin() or (investor_id = auth.uid() and is_active_user()));
+create policy inv_stocks_admin on public.investor_stocks for all using (is_admin()) with check (is_admin());
+create policy inv_returns_read  on public.investor_returns for select
+  using (is_admin() or (investor_id = auth.uid() and is_active_user()));
+create policy inv_returns_admin on public.investor_returns for all using (is_admin()) with check (is_admin());
+create policy prices_read  on public.stock_prices for select
+  using (is_admin() or exists (select 1 from public.profiles where id = auth.uid() and role = 'investor' and active));
+create policy prices_admin on public.stock_prices for all using (is_admin()) with check (is_admin());
+-- price_fetch_jobs: no policies → only the database functions use it
+
 -- Functions: only logged-in users may call them (each checks the role inside).
 revoke execute on all functions in schema public from public, anon;
 grant  execute on function public.settle_day(timestamptz), public.is_admin(), public.is_active_user(),
@@ -534,6 +697,7 @@ grant  execute on function public.settle_day(timestamptz), public.is_admin(), pu
        public.owner_contact(),
        public.cancel_request(bigint), public.run_settlement(date),
        public.request_commission(bigint, text, text, jsonb),
+       public.admin_create_investor(text, text, text, text), public.queue_price_fetch(), public.collect_prices(),
        public.admin_create_vendor(text, text, text, text), public.admin_set_password(uuid, text),
        public.admin_set_active(uuid, boolean)
   to authenticated;
@@ -542,13 +706,15 @@ revoke execute on function public._create_login(text, text, text, text, text), p
 
 -- Supabase grants table access to the "anon" role by default; RLS already blocks it, this makes it explicit.
 revoke all on public.profiles, public.accounts, public.requests, public.pnl_entries,
-              public.settlements, public.ledger, public.bets from anon;
+              public.settlements, public.ledger, public.bets,
+              public.investor_stocks, public.investor_returns, public.stock_prices, public.price_fetch_jobs from anon;
 
 -- ---------------------------------------------------------------------
 -- Live updates in the browser
 -- ---------------------------------------------------------------------
 alter publication supabase_realtime add table
-  public.profiles, public.accounts, public.requests, public.pnl_entries, public.settlements, public.ledger, public.bets;
+  public.profiles, public.accounts, public.requests, public.pnl_entries, public.settlements, public.ledger, public.bets,
+  public.investor_stocks, public.investor_returns, public.stock_prices;
 
 -- ---------------------------------------------------------------------
 -- Photos (cash tokens, slips, proofs). Private bucket; files are stored as

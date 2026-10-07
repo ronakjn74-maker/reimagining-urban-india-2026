@@ -72,7 +72,7 @@ Money you **paid** to vendors or **received** from them: date, mode, UTR or toke
 The anon key is designed to be public. Never paste the `service_role` key.
 
 ### 3. (Optional) Automatic settlement at 11:00 AM
-In the SQL Editor, run [`supabase/auto-settlement.sql`](supabase/auto-settlement.sql).
+In the SQL Editor, run [`supabase/automation.sql`](supabase/automation.sql).
 
 ### 4. Other free hosts (optional)
 **Cloudflare Pages** (works with a private repo):
@@ -100,4 +100,4 @@ Netlify works the same way (drag and drop the folder). GitHub Pages works only i
 - `index.html`, `styles.css`, `app.js`: the app (no build step).
 - `config.js`: your Supabase URL and key.
 - `supabase/schema.sql`: tables, security rules and functions.
-- `supabase/auto-settlement.sql`: optional daily 11:00 AM settlement.
+- `supabase/automation.sql`: daily 11:00 AM commission settlement and automatic stock prices.

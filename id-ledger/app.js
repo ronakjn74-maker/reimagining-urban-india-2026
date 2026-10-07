@@ -27,10 +27,11 @@ const S = {
   owner: null,
   view: null,
   live: false,
-  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [], bets: [] },
+  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [], bets: [], invStocks: [], invReturns: [], prices: [] },
   f: { idSearch: '', idVendor: '', idStatus: 'active', reqTab: 'pending', reqVendor: '', pnlDate: null, comDate: null, ledVendor: '' },
 };
 const isAdmin = () => S.me?.role === 'admin';
+const isInvestor = () => S.me?.role === 'investor';
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -133,17 +134,20 @@ async function fetchAll(table, order) {
   }
 }
 async function loadData() {
-  const admin = isAdmin();
-  const [profiles, accounts, requests, settlements, pnl, ledger, bets] = await Promise.all([
+  const admin = isAdmin(); const inv = admin || isInvestor(); const ven = !isInvestor();
+  const [profiles, accounts, requests, settlements, pnl, ledger, bets, invStocks, invReturns, prices] = await Promise.all([
     fetchAll('profiles', 'created_at'),
-    fetchAll('accounts', 'created_at'),
-    fetchAll('requests', 'created_at'),
-    fetchAll('settlements', 'settle_date'),
+    ven ? fetchAll('accounts', 'created_at') : [],
+    ven ? fetchAll('requests', 'created_at') : [],
+    ven ? fetchAll('settlements', 'settle_date') : [],
     admin ? fetchAll('pnl_entries', 'created_at') : [],
     admin ? fetchAll('ledger', 'entry_date') : [],
     admin ? fetchAll('bets', 'created_at') : [],
+    inv ? fetchAll('investor_stocks', 'created_at') : [],
+    inv ? fetchAll('investor_returns', 'created_at') : [],
+    inv ? fetchAll('stock_prices', 'price_date') : [],
   ]);
-  S.data = { profiles, accounts, requests, settlements, pnl, ledger, bets };
+  S.data = { profiles, accounts, requests, settlements, pnl, ledger, bets, invStocks, invReturns, prices };
   const me = profiles.find((p) => p.id === S.me.id);
   if (me) S.me = me;
 }
@@ -217,7 +221,7 @@ async function startSession(user) {
     return renderLogin('This login is not active. Contact the owner.');
   }
   S.me = me;
-  S.view = S.view || (isAdmin() ? 'dashboard' : 'ids');
+  S.view = S.view || (isAdmin() ? 'dashboard' : isInvestor() ? 'investors' : 'ids');
   try { await loadData(); } catch (e) { fail(e); }
   if (!isAdmin()) {
     const { data } = await sb.rpc('owner_contact');
@@ -239,8 +243,9 @@ sb.auth.onAuthStateChange((event, session) => {
 // ---------- shell ----------
 function navItems() {
   const pend = S.data.requests.filter((r) => r.status === 'pending').length;
+  if (isInvestor()) return [['investors', 'My stocks']];
   return isAdmin()
-    ? [['dashboard', 'Dashboard'], ['ids', 'IDs'], ['requests', 'Requests', pend], ['pnl', 'Bets & P&L'], ['commission', 'Commission'], ['ledger', 'Ledger'], ['vendors', 'Vendors']]
+    ? [['dashboard', 'Dashboard'], ['ids', 'IDs'], ['requests', 'Requests', pend], ['pnl', 'Bets & P&L'], ['commission', 'Commission'], ['ledger', 'Ledger'], ['investors', 'Investors'], ['vendors', 'Vendors']]
     : [['ids', 'My IDs'], ['requests', 'Requests', pend], ['commission', 'Commission']];
 }
 function renderShell() {
@@ -273,8 +278,8 @@ function renderView() {
   if (!S.me || !$('#view')) return;
   renderTabs();
   const v = $('#view');
-  const views = { dashboard: viewDashboard, ids: viewIds, requests: viewRequests, pnl: viewPnl, commission: viewCommission, ledger: viewLedger, vendors: viewVendors };
-  const fn = views[S.view] || viewIds;
+  const views = { dashboard: viewDashboard, ids: viewIds, requests: viewRequests, pnl: viewPnl, commission: viewCommission, ledger: viewLedger, investors: viewInvestors, vendors: viewVendors };
+  const fn = isInvestor() ? viewInvestors : (views[S.view] || viewIds);
   // keep focus/scroll on live refresh
   const active = document.activeElement?.id; const pos = active ? document.activeElement.selectionStart : null;
   const typed = [...v.querySelectorAll('form[id] input[name]:not([type=file]):not([type=radio]):not([type=checkbox])')]
@@ -371,6 +376,7 @@ function viewDashboard(v) {
       ${kpi('Paid to vendors', money(paid), 'Payment ledger')}
       ${kpi('Received from vendors', money(received), 'Payment ledger')}
       ${kpi('Ledger net', signed(received - paid), 'Received − paid')}
+      ${investors().length ? kpi('Due to investors', money(sum(investors(), (p) => investorPosition(p.id).tot.due)), 'Shares owed × latest price') : ''}
     </div>
     <div class="section">
       <div class="section-head"><h2>Vendors</h2></div>
@@ -889,7 +895,7 @@ function viewCommission(v) {
     ${admin ? `<div class="card section">
       <h3 style="margin-bottom:8px">Settle a day</h3>
       <div class="row"><input type="date" id="com-date" value="${comDate}" style="flex:1 1 160px;width:auto"><button class="btn primary" id="run-settle">Run settlement</button></div>
-      <p class="muted small" style="margin:8px 0 0">Runs automatically at 11:00 AM if auto-settlement is switched on (see README). Running again re-calculates rows that are still due.</p>
+      <p class="muted small" style="margin:8px 0 0">Runs automatically at 11:00 AM. Running again re-calculates rows that are still due.</p>
     </div>
     ${preview.length ? `<div class="section"><div class="section-head"><h2>Running today (${fmtD(cur)})</h2></div>${commTable(preview.map((c) => ({ ...c, net_pnl: c.net, commission_pct: c.pct, status: 'running' })), false)}</div>` : ''}` : ''}
     ${dates.length ? dates.map((d) => `<div class="section"><div class="section-head"><h2>${fmtD(d)}</h2>
@@ -1068,6 +1074,257 @@ function ledgerForm() {
 }
 
 // ============================================================
+// INVESTORS — shares they sold for us; we owe the shares back
+// ============================================================
+const investors = () => S.data.profiles.filter((p) => p.role === 'investor').sort((a, b) => a.name.localeCompare(b.name));
+const qtyFmt = (n) => Number(n).toLocaleString('en-IN', { maximumFractionDigits: 4 });
+const stockKey = (x) => `${x.symbol}|${x.exchange}`;
+// latest price on or before a date
+function priceOn(symbol, exchange, date = '9999-12-31') {
+  let best = null;
+  for (const p of S.data.prices) if (p.symbol === symbol && p.exchange === exchange && p.price_date <= date && (!best || p.price_date > best.price_date)) best = p;
+  return best;
+}
+function investorPosition(invId, asOf = '9999-12-31') {
+  const stocks = S.data.invStocks.filter((x) => x.investor_id === invId && x.sold_on <= asOf);
+  const rets = S.data.invReturns.filter((x) => x.investor_id === invId && x.paid_on <= asOf);
+  const by = {};
+  stocks.forEach((x) => {
+    const r = (by[stockKey(x)] ||= { symbol: x.symbol, exchange: x.exchange, name: x.stock_name, soldQty: 0, received: 0, retQty: 0, retValue: 0 });
+    r.soldQty += Number(x.qty); r.received += Number(x.qty) * Number(x.sell_rate); r.name ||= x.stock_name;
+  });
+  rets.forEach((x) => { const r = by[stockKey(x)]; if (r) { r.retQty += Number(x.qty); r.retValue += Number(x.amount); } });
+  const rows = Object.values(by).map((r) => {
+    const price = priceOn(r.symbol, r.exchange, asOf);
+    const owed = Math.max(0, Math.round((r.soldQty - r.retQty) * 10000) / 10000);
+    return { ...r, owed, price, due: price ? owed * Number(price.close) : null, avgRate: r.received / r.soldQty };
+  });
+  const tot = {
+    received: sum(rows, (r) => r.received), returned: sum(rows, (r) => r.retValue),
+    due: sum(rows, (r) => r.due || 0), missing: rows.filter((r) => r.owed > 0 && !r.price).length,
+    owedAtSellRate: sum(rows, (r) => r.owed * r.avgRate),
+  };
+  return { rows, tot };
+}
+function investorDaily(invId, days = 30) {
+  const syms = new Set(S.data.invStocks.filter((x) => x.investor_id === invId).map(stockKey));
+  const dates = [...new Set(S.data.prices.filter((p) => syms.has(stockKey(p))).map((p) => p.price_date))].sort().reverse().slice(0, days);
+  return dates.map((d) => ({ date: d, due: investorPosition(invId, d).tot.due }));
+}
+
+function viewInvestors(v) {
+  const admin = isAdmin();
+  const list = admin ? investors() : [S.me];
+  if (!S.f.investor || !list.some((p) => p.id === S.f.investor)) S.f.investor = list.length === 1 || !admin ? list[0]?.id : null;
+  if (admin && !S.f.investor) {
+    v.innerHTML = `
+      <div class="section-head"><h2>Investors</h2><button class="btn primary" id="add-inv">+ Add investor</button></div>
+      <p class="muted small">Shares an investor sold to fund the business. You owe the <b>shares</b> back, so the amount due moves with the market price every day.</p>
+      <div class="list">${list.length ? list.map((p) => { const { tot } = investorPosition(p.id); return `<div class="item" data-inv="${p.id}" style="cursor:pointer">
+        <div class="row between"><h3>${esc(p.name)}</h3><span class="big" style="font-size:1.15rem">${money(tot.due)}</span></div>
+        <div class="row between small muted" style="margin-top:4px"><span>Gave you ${money(tot.received)} · returned ${money(tot.returned)}</span><span>due today</span></div>
+      </div>`; }).join('') : '<div class="empty">No investors yet. Add Sanjay with <b>+ Add investor</b>.</div>'}</div>`;
+    $('#add-inv').onclick = () => investorForm();
+    v.querySelectorAll('[data-inv]').forEach((el) => el.onclick = () => { S.f.investor = el.dataset.inv; renderView(); });
+    return;
+  }
+  const inv = prof(S.f.investor) || S.me;
+  const { rows, tot } = investorPosition(inv.id);
+  const daily = investorDaily(inv.id);
+  const lastDate = daily[0]?.date;
+  const change = daily.length > 1 ? daily[0].due - daily[1].due : null;
+  const rets = S.data.invReturns.filter((x) => x.investor_id === inv.id);
+  v.innerHTML = `
+    <div class="section-head">
+      ${admin && investors().length > 1 ? '<button class="btn sm" id="inv-back">← All</button>' : ''}
+      <h2>${admin ? esc(inv.name) : 'My stocks'}</h2>
+      ${admin ? `<button class="btn sm wa" id="inv-wa" ${inv.phone ? '' : 'disabled title="Add phone"'}>Send update</button>` : ''}
+    </div>
+    <div class="kpis section">
+      ${kpi(admin ? 'Amount due today' : 'Due to you today', money(tot.due), lastDate ? `Prices of ${fmtD(lastDate)}${change != null ? ` · ${change >= 0 ? '+' : ''}${money(change)} vs previous day` : ''}` : 'No prices yet')}
+      ${kpi(admin ? 'Money he gave' : 'Money you gave', money(tot.received), 'Shares × sell rate')}
+      ${kpi('Returned so far', money(tot.returned), 'Shares + cash')}
+      ${kpi('Market move on shares still owed', signed(tot.due - tot.owedAtSellRate), 'Today’s value − value at sell rate')}
+    </div>
+    ${tot.missing ? `<p class="neg small">${tot.missing} stock(s) have no price yet${admin ? ' – press Update prices, or type the price.' : '.'}</p>` : ''}
+    ${admin ? `<div class="row section">
+      <button class="btn primary" id="inv-add-stock">+ Stock sold</button>
+      <button class="btn" id="inv-return">Return / pay</button>
+      <button class="btn" id="inv-refresh">↻ Update prices</button>
+      <button class="btn" id="inv-price">Type a price</button>
+    </div>` : ''}
+    <div class="section">
+      <div class="section-head"><h2>Stocks</h2></div>
+      ${rows.length ? `<div class="list">${rows.map((r) => `<div class="item">
+        <div class="row between"><div><b>${esc(r.symbol)}</b> <span class="muted small">${r.exchange}${r.name ? ` · ${esc(r.name)}` : ''}</span></div>
+          <span class="big" style="font-size:1.1rem">${r.due != null ? money(r.due) : '—'}</span></div>
+        <dl class="kv" style="margin-top:6px">
+          <dt>Sold</dt><dd>${qtyFmt(r.soldQty)} @ ${money(r.avgRate)} = ${money(r.received)}</dd>
+          ${r.retQty ? `<dt>Returned</dt><dd>${qtyFmt(r.retQty)} shares (${money(r.retValue)})</dd>` : ''}
+          <dt>Still owed</dt><dd><b>${qtyFmt(r.owed)} shares</b></dd>
+          <dt>Price</dt><dd>${r.price ? `${money(r.price.close)} <span class="muted small">${fmtD(r.price.price_date)}${r.price.source === 'manual' ? ' · typed' : ''}</span>` : '<span class="neg">not yet</span>'}</dd>
+        </dl></div>`).join('')}</div>` : '<div class="empty">No stocks yet</div>'}
+    </div>
+    <div class="section">
+      <div class="section-head"><h2>Daily amount due</h2></div>
+      ${daily.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th class="r">Amount due</th><th class="r">Change</th></tr></thead><tbody>
+        ${daily.map((d, i) => `<tr><td>${fmtD(d.date)}</td><td class="r num">${money(d.due)}</td><td class="r">${daily[i + 1] ? signed(d.due - daily[i + 1].due) : ''}</td></tr>`).join('')}
+      </tbody></table></div>` : '<div class="empty">Appears once prices are in</div>'}
+    </div>
+    <div class="section">
+      <div class="section-head"><h2>Returns & payments</h2></div>
+      ${rets.length ? `<div class="list">${rets.map((x) => `<div class="item row between">
+        <div><b>${x.mode === 'cash' ? `Cash ${money(x.amount)}` : `${qtyFmt(x.qty)} ${esc(x.symbol)} shares`}</b>
+          <div class="muted small">${fmtD(x.paid_on)} · ${x.mode === 'cash' ? `= ${qtyFmt(x.qty)} ${esc(x.symbol)} @ ${money(x.rate)}` : `worth ${money(x.amount)} @ ${money(x.rate)}`}${x.payment_mode ? ` · ${esc(x.payment_mode)}` : ''}${x.reference ? ` · ${esc(x.reference)}` : ''}${x.note ? ` · ${esc(x.note)}` : ''}</div></div>
+        ${admin ? `<button class="icon-btn" data-del-ret="${x.id}" title="Delete">🗑</button>` : ''}</div>`).join('')}</div>` : '<div class="empty">Nothing returned yet</div>'}
+    </div>
+    ${admin ? `<div class="section"><div class="section-head"><h2>Stocks he sold (entries)</h2></div>
+      <div class="list">${S.data.invStocks.filter((x) => x.investor_id === inv.id).map((x) => `<div class="item row between">
+        <div><b>${esc(x.symbol)}</b> <span class="muted small">${x.exchange} · ${qtyFmt(x.qty)} @ ${money(x.sell_rate)} · ${fmtD(x.sold_on)}${x.note ? ` · ${esc(x.note)}` : ''}</span></div>
+        <div class="row"><button class="icon-btn" data-edit-stock="${x.id}" title="Edit">✎</button><button class="icon-btn" data-del-stock="${x.id}" title="Delete">🗑</button></div></div>`).join('') || '<div class="empty">None</div>'}</div></div>` : ''}`;
+  if (!admin) return;
+  $('#inv-back')?.addEventListener('click', () => { S.f.investor = null; renderView(); });
+  $('#inv-wa').onclick = () => openWA(inv.phone, investorMessage(inv));
+  $('#inv-add-stock').onclick = () => stockForm(inv);
+  $('#inv-return').onclick = () => returnForm(inv, rows);
+  $('#inv-price').onclick = () => priceForm(rows);
+  $('#inv-refresh').onclick = (e) => busy(e.target, async () => {
+    const n = must(await sb.rpc('queue_price_fetch'));
+    if (!n) return toast('No stocks to price');
+    await new Promise((r) => setTimeout(r, 5000));
+    const got = must(await sb.rpc('collect_prices'));
+    toast(`Prices updated: ${got} of ${n}${got < n ? ' – try again in a minute, or type the price' : ''}`); scheduleReload();
+  });
+  v.querySelectorAll('[data-del-ret]').forEach((b) => b.onclick = () => confirm('Delete this return / payment?') &&
+    busy(b, async () => { must(await sb.from('investor_returns').delete().eq('id', b.dataset.delRet)); toast('Deleted'); scheduleReload(); }));
+  v.querySelectorAll('[data-del-stock]').forEach((b) => b.onclick = () => confirm('Delete this stock entry?') &&
+    busy(b, async () => { must(await sb.from('investor_stocks').delete().eq('id', b.dataset.delStock)); toast('Deleted'); scheduleReload(); }));
+  v.querySelectorAll('[data-edit-stock]').forEach((b) => b.onclick = () => stockForm(inv, S.data.invStocks.find((x) => x.id === Number(b.dataset.editStock))));
+}
+function investorMessage(inv) {
+  const { rows, tot } = investorPosition(inv.id);
+  const d = investorDaily(inv.id, 1)[0]?.date;
+  return [`Hi ${inv.name}, update${d ? ` (prices of ${fmtD(d)})` : ''}:`, '',
+    ...rows.filter((r) => r.owed > 0).map((r) => `${r.symbol}: ${qtyFmt(r.owed)} shares × ${r.price ? money(r.price.close) : '?'} = ${r.due != null ? money(r.due) : '—'}`),
+    '', `*Total due: ${money(tot.due)}*`, `You gave: ${money(tot.received)}`, `Returned so far: ${money(tot.returned)}`, '', `Details: ${APP_URL}`].join('\n');
+}
+function investorForm() {
+  openModal('Add investor', `
+    <form id="inv-form">
+      <div class="field"><label>Name</label><input name="name" required placeholder="Sanjay"></div>
+      <div class="field"><label>WhatsApp number</label><input name="phone" type="tel"></div>
+      <div class="fields two">
+        <div class="field"><label>Login username</label><input name="username" required autocapitalize="none" pattern="[A-Za-z0-9._\-]{3,30}"></div>
+        <div class="field"><label>Password</label><input name="password" required minlength="6" value="${Math.random().toString(36).slice(2, 10)}"></div>
+      </div>
+      <p class="muted small">He will see only his stocks, the amount due and payments.</p>
+      <button class="btn primary block">Add investor</button>
+    </form>`, (root) => {
+    $('#inv-form', root).onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(e.target);
+      busy(e.submitter, async () => {
+        const id = must(await sb.rpc('admin_create_investor', { p_username: f.username, p_password: f.password, p_name: f.name, p_phone: f.phone || null }));
+        S.f.investor = id;
+        credentialsModal({ name: f.name.trim(), username: f.username.trim().toLowerCase(), phone: f.phone, role: 'investor' }, f.password, 'Investor added');
+        scheduleReload();
+      });
+    };
+  });
+}
+function stockForm(inv, x = null) {
+  openModal(x ? 'Edit stock entry' : `Stock sold by ${inv.name}`, `
+    <form id="stk-form">
+      <div class="fields two">
+        <div class="field"><label>Stock symbol (as on NSE/BSE)</label><input name="symbol" value="${esc(x?.symbol)}" required autocapitalize="characters" placeholder="RELIANCE"></div>
+        <div class="field"><label>Exchange</label><select name="exchange"><option>NSE</option><option ${x?.exchange === 'BSE' ? 'selected' : ''}>BSE</option></select></div>
+        <div class="field"><label>Quantity sold</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal" value="${esc(x?.qty ?? '')}" required></div>
+        <div class="field"><label>Sell rate ₹</label><input name="sell_rate" type="number" step="0.01" min="0.01" inputmode="decimal" value="${esc(x?.sell_rate ?? '')}" required></div>
+        <div class="field"><label>Date sold</label><input name="sold_on" type="date" value="${esc(x?.sold_on || todayIST())}" required></div>
+        <div class="field"><label>Company name (optional)</label><input name="stock_name" value="${esc(x?.stock_name)}"></div>
+      </div>
+      <div class="card small" id="stk-total" style="margin-bottom:12px"></div>
+      <div class="field"><label>Note</label><input name="note" value="${esc(x?.note)}"></div>
+      <button class="btn primary block">${x ? 'Save' : 'Add stock'}</button>
+    </form>`, (root) => {
+    const form = $('#stk-form', root);
+    const tot = () => { const f = formObj(form); $('#stk-total', root).innerHTML = `Money he gave for this: <b>${money(Number(f.qty || 0) * Number(f.sell_rate || 0))}</b>`; };
+    form.addEventListener('input', tot); tot();
+    form.onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(form);
+      const row = { investor_id: inv.id, symbol: f.symbol.trim().toUpperCase(), exchange: f.exchange, qty: Number(f.qty), sell_rate: Number(f.sell_rate),
+        sold_on: f.sold_on, stock_name: f.stock_name.trim() || null, note: f.note.trim() || null };
+      busy(e.submitter, async () => {
+        if (x) must(await sb.from('investor_stocks').update(row).eq('id', x.id)); else must(await sb.from('investor_stocks').insert(row));
+        modal.close(); toast('Saved – press Update prices to get today’s price'); scheduleReload();
+      });
+    };
+  });
+}
+function returnForm(inv, rows) {
+  const open = rows.filter((r) => r.owed > 0);
+  if (!open.length) return toast('Nothing owed', 'error');
+  openModal(`Return to ${inv.name}`, `
+    <form id="ret-form">
+      <div class="field"><div class="seg"><label><input type="radio" name="mode" value="shares" checked><span>Give shares</span></label><label><input type="radio" name="mode" value="cash"><span>Pay cash</span></label></div></div>
+      <div class="field"><label>Stock</label><select name="stock">${open.map((r) => `<option value="${esc(stockKey(r))}">${esc(r.symbol)} (${r.exchange}) – ${qtyFmt(r.owed)} owed</option>`).join('')}</select></div>
+      <div class="fields two">
+        <div class="field" data-m="shares"><label>Shares returned</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal"></div>
+        <div class="field hidden" data-m="cash"><label>Amount paid ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal"></div>
+        <div class="field"><label>Price per share ₹</label><input name="rate" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+        <div class="field"><label>Date</label><input name="paid_on" type="date" value="${todayIST()}" required></div>
+        <div class="field" data-m="cash"><label>Paid by</label><select name="payment_mode">${['Cash', 'UPI', 'Bank transfer', 'Other'].map((m) => `<option>${m}</option>`).join('')}</select></div>
+      </div>
+      <div class="card small" id="ret-calc" style="margin-bottom:12px"></div>
+      <div class="field"><label>Reference / note</label><input name="reference"></div>
+      <button class="btn primary block">Save</button>
+    </form>`, (root) => {
+    const form = $('#ret-form', root); const el = form.elements;
+    const cur = () => open.find((r) => stockKey(r) === el.stock.value);
+    const fillRate = () => { const r = cur(); if (r?.price) el.rate.value = r.price.close; };
+    const sync = () => {
+      const cash = el.mode.value === 'cash';
+      root.querySelectorAll('[data-m]').forEach((d) => d.classList.toggle('hidden', d.dataset.m === 'cash' ? !cash : cash));
+      $('[data-m="cash"] select', root).closest('.field').classList.toggle('hidden', !cash);
+      const r = cur(); const rate = Number(el.rate.value || 0);
+      const q = cash ? (rate ? Number(el.amount.value || 0) / rate : 0) : Number(el.qty.value || 0);
+      $('#ret-calc', root).innerHTML = cash
+        ? `Counts as <b>${qtyFmt(Math.round(q * 10000) / 10000)}</b> ${esc(r.symbol)} shares returned. Left owed: ${qtyFmt(Math.max(0, Math.round((r.owed - q) * 10000) / 10000))}`
+        : `Value <b>${money(q * rate)}</b>. Left owed: ${qtyFmt(Math.max(0, Math.round((r.owed - q) * 10000) / 10000))} shares`;
+    };
+    el.stock.onchange = () => { fillRate(); sync(); };
+    form.addEventListener('input', sync); form.addEventListener('change', sync); fillRate(); sync();
+    form.onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(form); const r = cur(); const cash = f.mode === 'cash';
+      const row = { investor_id: inv.id, symbol: r.symbol, exchange: r.exchange, mode: f.mode, rate: Number(f.rate), paid_on: f.paid_on,
+        qty: cash ? 0 : Number(f.qty), amount: cash ? Number(f.amount) : 0, payment_mode: cash ? f.payment_mode : 'Shares', reference: f.reference.trim() || null };
+      if (!(cash ? row.amount > 0 : row.qty > 0)) return toast(cash ? 'Enter the amount' : 'Enter the shares', 'error');
+      busy(e.submitter, async () => { must(await sb.from('investor_returns').insert(row)); modal.close(); toast('Saved'); scheduleReload(); });
+    };
+  });
+}
+function priceForm(rows) {
+  if (!rows.length) return toast('Add a stock first', 'error');
+  openModal('Type a closing price', `
+    <form id="px-form">
+      <div class="field"><label>Stock</label><select name="stock">${rows.map((r) => `<option value="${esc(stockKey(r))}">${esc(r.symbol)} (${r.exchange})</option>`).join('')}</select></div>
+      <div class="fields two">
+        <div class="field"><label>Date</label><input name="price_date" type="date" value="${todayIST()}" required></div>
+        <div class="field"><label>Closing price ₹</label><input name="close" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+      </div>
+      <p class="muted small">A typed price is never overwritten by the automatic update.</p>
+      <button class="btn primary block">Save price</button>
+    </form>`, (root) => {
+    $('#px-form', root).onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(e.target); const [symbol, exchange] = f.stock.split('|');
+      busy(e.submitter, async () => {
+        must(await sb.from('stock_prices').upsert({ symbol, exchange, price_date: f.price_date, close: Number(f.close), source: 'manual', updated_at: new Date().toISOString() }));
+        modal.close(); toast('Price saved'); scheduleReload();
+      });
+    };
+  });
+}
+
+// ============================================================
 // VENDORS (owner only)
 // ============================================================
 function viewVendors(v) {
@@ -1144,7 +1401,10 @@ function vendorForm(p = null) {
   });
 }
 function credentialsModal(p, pw, title) {
-  const text = `Hi ${p.name}, your login for the ID Ledger app:\n\nLink: ${shareLink()}\nUsername: ${p.username}\nPassword: ${pw}\n\nAdd the IDs you give me there and accept my transfer / deposit / withdrawal requests once done.`;
+  const role = p.role || prof(p.id)?.role || 'vendor';
+  const text = `Hi ${p.name}, your login for the ID Ledger app:\n\nLink: ${shareLink()}\nUsername: ${p.username}\nPassword: ${pw}\n\n${role === 'investor'
+    ? 'You can see your stocks, the amount due to you (updated daily with market prices) and every payment there.'
+    : 'Add the IDs you give me there and accept my transfer / deposit / withdrawal requests once done.'}`;
   openModal(title, `
     <dl class="kv" style="margin-bottom:14px"><dt>Link</dt><dd>${esc(APP_URL)}</dd><dt>Username</dt><dd class="secret">${esc(p.username)}</dd><dt>Password</dt><dd class="secret">${esc(pw)}</dd></dl>
     <div class="stack">
