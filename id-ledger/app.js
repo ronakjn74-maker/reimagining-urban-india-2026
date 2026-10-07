@@ -301,7 +301,8 @@ const depCredit = (r) => r.kind === 'deposit' ? Number(r.credit_amount ?? r.amou
 // credited = start balance + completed deposit requests into the ID.
 function idCredit(a) {
   const pct = Number(a.upfront_pct ?? 10) / 100;   // upfront deduction, separate from the loss commission %
-  const deps = S.data.requests.filter((r) => r.kind === 'deposit' && r.status === 'completed' && r.to_account === a.id);
+  // reset recharges replace lost balance (paid net of loss commission) – they are not balance bought at the upfront rate
+  const deps = S.data.requests.filter((r) => r.kind === 'deposit' && r.status === 'completed' && r.to_account === a.id && !r.is_reset);
   const credited = Number(a.opening_balance || 0) + sum(deps, (r) => depCredit(r));
   const paid = Number(a.deposit || 0) + sum(deps, (r) => r.amount);
   const shouldPay = credited * (1 - pct);
@@ -425,11 +426,12 @@ function viewDashboard(v) {
         </tr>`; }).join('')}</tbody></table></div>` : `<div class="empty">No vendors yet. Create one in <b>Vendors</b>.</div>`}
     </div>
     <div class="section">
-      <div class="section-head"><h2>Pending requests</h2><button class="btn sm primary" id="dash-new-req">+ New request</button></div>
+      <div class="section-head"><h2>Pending requests</h2><button class="btn sm" id="dash-reset">↺ Reset all IDs to start</button><button class="btn sm primary" id="dash-new-req">+ New request</button></div>
       <div class="list" id="dash-pending">${pending.length ? pending.map(requestCard).join('') : '<div class="empty">No pending requests</div>'}</div>
     </div>`;
   v.querySelectorAll('[data-remind]').forEach((b) => b.onclick = () => openWA(prof(b.dataset.remind)?.phone, reminderMessage(b.dataset.remind)));
   $('#dash-new-req').onclick = () => requestForm();
+  $('#dash-reset').onclick = () => resetForm();
   bindRequestCards($('#dash-pending'));
 }
 const kpi = (label, value, sub = '') => `<div class="kpi"><div class="label">${label}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
@@ -439,7 +441,7 @@ const kpi = (label, value, sub = '') => `<div class="kpi"><div class="label">${l
 // ============================================================
 function viewIds(v) {
   v.innerHTML = `
-    <div class="section-head"><h2>${isAdmin() ? 'IDs' : 'My IDs'}</h2><button class="btn primary" id="add-id">+ Add ID</button></div>
+    <div class="section-head"><h2>${isAdmin() ? 'IDs' : 'My IDs'}</h2>${isAdmin() ? '<button class="btn" id="reset-ids">↺ Reset all to start</button>' : ''}<button class="btn primary" id="add-id">+ Add ID</button></div>
     <div class="toolbar">
       <input id="id-search" type="search" placeholder="Search site / username" value="${esc(S.f.idSearch)}">
       ${isAdmin() ? `<select id="id-vendor"><option value="">All vendors</option>${vendors().map((p) => `<option value="${p.id}" ${S.f.idVendor === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>` : ''}
@@ -449,6 +451,7 @@ function viewIds(v) {
     <div class="grid" id="id-list"></div>`;
   $('#id-status').value = S.f.idStatus;
   $('#add-id').onclick = () => idForm();
+  $('#reset-ids')?.addEventListener('click', () => resetForm(S.f.idVendor || null));
   $('#id-search').oninput = (e) => { S.f.idSearch = e.target.value; drawIdList(); };
   $('#id-vendor')?.addEventListener('change', (e) => { S.f.idVendor = e.target.value; drawIdList(); });
   $('#id-status').onchange = (e) => { S.f.idStatus = e.target.value; drawIdList(); };
@@ -511,6 +514,46 @@ function onIdListClick(e) {
   if (act === 'req') requestForm({ vendor: a.vendor_id, from: a.id });
 }
 
+// P&L since the last reset = how far the ID is from where it started.
+function resetPlan(vendorId = null) {
+  const pendingReset = new Set(S.data.requests.filter((r) => r.is_reset && r.status === 'pending').map((r) => r.to_account || r.from_account));
+  return S.data.accounts.filter((a) => a.status === 'active' && (!vendorId || a.vendor_id === vendorId)).map((a) => {
+    const diff = Math.round(sum(S.data.pnl.filter((p) => p.account_id === a.id && (!a.last_reset_at || p.created_at > a.last_reset_at)), (p) => p.amount) * 100) / 100;
+    const comm = diff < 0 ? Math.round(-diff * Number(a.commission_pct) ) / 100 : 0;
+    return { a, diff, comm, start: Number(a.current_balance) - diff, pending: pendingReset.has(a.id) };
+  });
+}
+function resetForm(vendorId = null) {
+  const plan = resetPlan(vendorId);
+  const todo = plan.filter((x) => x.diff !== 0 && !x.pending);
+  const wd = sum(todo.filter((x) => x.diff > 0), (x) => x.diff);
+  const rc = sum(todo.filter((x) => x.diff < 0), (x) => -x.diff);
+  const comm = sum(todo, (x) => x.comm);
+  const pay = rc - comm;
+  openModal('Reset all IDs to start', `
+    <p class="small muted">Every ID goes back to where it started. Profit is withdrawn, loss is recharged – you pay the loss minus your loss commission.</p>
+    <div class="table-wrap"><table><thead><tr><th>ID</th><th class="r">Now</th><th class="r">Start</th><th class="r">Action</th><th class="r">Commission</th></tr></thead><tbody>
+      ${plan.map((x) => `<tr><td>${esc(accName(x.a))}</td><td class="r num">${money(x.a.current_balance)}</td><td class="r num">${money(x.start)}</td>
+        <td class="r">${x.pending ? '<span class="pill pending">reset pending</span>' : x.diff > 0 ? `<span class="pos">Withdraw ${money(x.diff)}</span>` : x.diff < 0 ? `<span class="neg">Recharge ${money(-x.diff)}</span>` : '<span class="muted">at start</span>'}</td>
+        <td class="r num">${x.comm && !x.pending ? money(x.comm) : ''}</td></tr>`).join('')}
+    </tbody></table></div>
+    <div class="kpis" style="margin:12px 0">
+      ${kpi('You receive (withdrawals)', money(wd))}
+      ${kpi('You pay (recharges)', money(pay), `Loss ${money(rc)} − commission ${money(comm)}`)}
+      ${kpi('Loss commission', `<span class="pos">${money(comm)}</span>`, 'Deducted from the recharges')}
+      ${kpi('Net result', signed(wd - pay), 'Received − paid')}
+    </div>
+    ${todo.length ? `<button class="btn primary block" id="do-reset">Send ${todo.length} request${todo.length > 1 ? 's' : ''} to the vendor${vendorId ? '' : 's'}</button>
+      <p class="muted small">The balances change when the vendor accepts each request.</p>` : '<div class="empty">All IDs are already at their start balance</div>'}`, (root) => {
+    $('#do-reset', root)?.addEventListener('click', (e) => busy(e.target, async () => {
+      const n = must(await sb.rpc('reset_to_start', { p_vendor: vendorId }));
+      modal.close(); toast(`${n} reset request${n === 1 ? '' : 's'} sent`);
+      await loadData(); renderView();
+      const vids = [...new Set(todo.map((x) => x.a.vendor_id))].filter((v) => prof(v)?.phone);
+      if (vids.length) openModal('Send on WhatsApp', vids.map((v) => `<a class="btn wa block" style="margin-bottom:8px" href="${esc(waUrl(prof(v).phone, reminderMessage(v)))}" target="_blank" rel="noopener">WhatsApp ${esc(vendorName(v))}</a>`).join(''));
+    }));
+  });
+}
 function idForm(a = null) {
   const admin = isAdmin();
   const vs = vendors().filter((p) => p.active || p.id === a?.vendor_id);

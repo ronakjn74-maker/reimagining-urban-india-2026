@@ -52,6 +52,7 @@ create table public.accounts (
   commission_pct   numeric(5,2)  not null default 10 check (commission_pct between 0 and 100),   -- loss commission
   upfront_pct      numeric(5,2)  not null default 10 check (upfront_pct >= 0 and upfront_pct < 100),  -- deducted when balance is bought (pay 90%)
   status           text not null default 'active' check (status in ('active','closed')),
+  last_reset_at    timestamptz,     -- P&L after this time = how far the ID is from its start
   notes            text,
   created_by       uuid,
   created_at       timestamptz not null default now(),
@@ -107,7 +108,9 @@ create table public.requests (
   from_account       uuid references public.accounts(id) on delete cascade,
   to_account         uuid references public.accounts(id) on delete cascade,
   amount             numeric(14,2) not null check (amount > 0),      -- deposit: money you pay
-  credit_amount      numeric(14,2),   -- deposit: balance added to the ID = amount ÷ (1 − commission %), commission taken upfront
+  credit_amount      numeric(14,2),
+  is_reset           boolean not null default false,   -- created by "Reset all IDs to start"
+  commission_amount  numeric(14,2),                    -- reset recharge: loss commission deducted from the payment   -- deposit: balance added to the ID = amount ÷ (1 − commission %), commission taken upfront
   note               text,
   status             text not null default 'pending'
                      check (status in ('pending','completed','rejected','cancelled')),
@@ -184,7 +187,7 @@ create or replace function public.respond_request(p_id bigint, p_accept boolean,
 returns void
 language plpgsql security definer set search_path = public as $$
 declare
-  r requests%rowtype; v_from numeric; v_to numeric;
+  r requests%rowtype; v_from numeric; v_to numeric; v_acc uuid; v_covered numeric;
 begin
   select * into r from requests where id = p_id for update;
   if not found then raise exception 'Request not found'; end if;
@@ -195,7 +198,6 @@ begin
   if p_proof is not null and p_proof not like r.vendor_id::text || '/%' then
     raise exception 'Proof must be stored in the vendor folder';
   end if;
-
   if p_accept then
     if r.from_account is not null then
       update accounts set current_balance = current_balance - r.amount
@@ -205,8 +207,24 @@ begin
       update accounts set current_balance = current_balance + coalesce(r.credit_amount, r.amount)
        where id = r.to_account returning current_balance into v_to;
     end if;
+    if r.is_reset then
+      v_acc := coalesce(r.to_account, r.from_account);
+      update accounts set last_reset_at = r.created_at where id = v_acc;
+      if coalesce(r.commission_amount, 0) > 0 then
+        -- commission was taken in this recharge: mark open commission lines as received …
+        select coalesce(sum(commission), 0) into v_covered from settlements where account_id = v_acc and status = 'due';
+        update settlements set status = 'received', payout = 'id', request_id = r.id, received_at = now()
+         where account_id = v_acc and status = 'due';
+        -- … and record the rest so the 11 AM settlement does not charge it again
+        if r.commission_amount - v_covered > 0 then
+          insert into settlements (account_id, vendor_id, settle_date, net_pnl, commission_pct, commission, status, payout, request_id, received_at)
+          select a.id, a.vendor_id, settle_day(now()), -r.credit_amount, a.commission_pct, r.commission_amount - v_covered,
+                 'received', 'id', r.id, now()
+            from accounts a where a.id = v_acc;
+        end if;
+      end if;
+    end if;
   end if;
-
   if r.kind = 'commission' then
     update settlements set
       status      = case when p_accept then 'received' else 'due' end,
@@ -215,7 +233,6 @@ begin
       received_at = case when p_accept then now() end
     where id = r.settlement_id;
   end if;
-
   update requests set
     status = case when p_accept then 'completed' else 'rejected' end,
     response_note = nullif(trim(p_note), ''),
@@ -225,6 +242,36 @@ begin
     responded_by = auth.uid(),
     responded_at = now()
   where id = p_id;
+end $$;
+
+-- Reset IDs to where they started: undo the P&L since the last reset.
+-- Profit -> withdrawal request; loss -> recharge (deposit) request crediting the loss, paid net of loss commission.
+create or replace function public.reset_to_start(p_vendor uuid default null) returns integer
+language plpgsql security definer set search_path = public as $$
+declare a record; diff numeric; c numeric; n integer := 0;
+begin
+  if not is_admin() then raise exception 'Only the owner can do this'; end if;
+  for a in
+    select * from accounts
+     where status = 'active' and (p_vendor is null or vendor_id = p_vendor)
+       and not exists (select 1 from requests r where r.is_reset and r.status = 'pending'
+                        and coalesce(r.to_account, r.from_account) = accounts.id)
+  loop
+    select coalesce(sum(p.amount), 0) into diff from pnl_entries p
+     where p.account_id = a.id and (a.last_reset_at is null or p.created_at > a.last_reset_at);
+    if diff > 0 then
+      insert into requests (kind, vendor_id, from_account, amount, note, created_by, is_reset)
+      values ('withdrawal', a.vendor_id, a.id, diff, 'Reset to start – profit ' || diff, auth.uid(), true);
+      n := n + 1;
+    elsif diff < 0 then
+      c := round(-diff * a.commission_pct / 100, 2);
+      insert into requests (kind, vendor_id, to_account, amount, credit_amount, commission_amount, note, created_by, is_reset)
+      values ('deposit', a.vendor_id, a.id, -diff - c, -diff, c,
+              'Reset to start – loss ' || (-diff) || ', ' || a.commission_pct || '% commission ' || c || ' deducted', auth.uid(), true);
+      n := n + 1;
+    end if;
+  end loop;
+  return n;
 end $$;
 
 create or replace function public.cancel_request(p_id bigint) returns void
@@ -809,7 +856,7 @@ grant  execute on function public.settle_day(timestamptz), public.is_admin(), pu
        public.create_request(text, uuid, uuid, numeric, text, jsonb), public.respond_request(bigint, boolean, text, text),
        public.owner_contact(), public.is_investor(),
        public.cancel_request(bigint), public.run_settlement(date),
-       public.request_commission(bigint, text, text, jsonb),
+       public.request_commission(bigint, text, text, jsonb), public.reset_to_start(uuid),
        public.admin_create_investor(text, text, text, text), public.queue_price_fetch(), public.collect_prices(),
        public.admin_create_vendor(text, text, text, text), public.admin_set_password(uuid, text),
        public.admin_set_active(uuid, boolean)
