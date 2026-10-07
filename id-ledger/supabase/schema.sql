@@ -280,30 +280,39 @@ create table public.settlements (
 );
 create index on public.settlements (account_id, settle_date);
 
+create or replace function public.settlement_calc(d date)
+returns table (account_id uuid, vendor_id uuid, net numeric, pct numeric, amt numeric)
+language sql stable security definer set search_path = public as $$
+  select a.id, a.vendor_id, t.net, a.commission_pct,
+         round(-t.net * a.commission_pct / 100, 2) - coalesce(dn.amount, 0)
+    from (select p.account_id, sum(p.amount) net from pnl_entries p where p.settle_date = d group by p.account_id) t
+    join accounts a on a.id = t.account_id
+    left join (select x.account_id, sum(x.commission) amount from settlements x
+                where x.settle_date = d and x.status in ('requested','received') group by x.account_id) dn
+           on dn.account_id = t.account_id
+   where t.net < 0
+$$;
+
+-- Unpaid lines are recalculated; lines already requested / received stay; extra loss later = top-up line.
 create or replace function public.run_settlement(p_date date default null) returns integer
 language plpgsql security definer set search_path = public as $$
 declare
   d date := coalesce(p_date, public.settle_day(now()) - 1);
   n integer;
 begin
-  -- auth.uid() is null only for the scheduled job / SQL editor (clients can't call this as anon).
   if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
-
-  -- Re-calculate whatever is still unpaid. Lines already requested / received stay as they are;
-  -- if more loss was entered for the day afterwards, only the difference is added as a new line.
-  delete from settlements where settle_date = d and status = 'due';
-
+  update settlements s set commission = 0, net_pnl = 0
+   where s.settle_date = d and s.status = 'due'
+     and not exists (select 1 from settlement_calc(d) c where c.account_id = s.account_id and c.amt > 0);
+  update settlements s set net_pnl = c.net, commission_pct = c.pct, commission = c.amt
+    from settlement_calc(d) c
+   where s.settle_date = d and s.status = 'due' and s.account_id = c.account_id and c.amt > 0;
   insert into settlements (account_id, vendor_id, settle_date, net_pnl, commission_pct, commission)
-  select a.id, a.vendor_id, d, t.net, a.commission_pct,
-         round(-t.net * a.commission_pct / 100, 2) - coalesce(done.amount, 0)
-    from (select account_id, sum(amount) net from pnl_entries where settle_date = d group by account_id) t
-    join accounts a on a.id = t.account_id
-    left join (select account_id, sum(commission) amount from settlements
-                where settle_date = d and status in ('requested','received') group by account_id) done
-           on done.account_id = t.account_id
-   where t.net < 0
-     and round(-t.net * a.commission_pct / 100, 2) - coalesce(done.amount, 0) > 0;
-  get diagnostics n = row_count;
+  select c.account_id, c.vendor_id, d, c.net, c.pct, c.amt
+    from settlement_calc(d) c
+   where c.amt > 0
+     and not exists (select 1 from settlements s where s.account_id = c.account_id and s.settle_date = d and s.status = 'due');
+  select count(*) into n from settlements where settle_date = d and status = 'due' and commission > 0;
   return n;
 end $$;
 
@@ -499,6 +508,7 @@ create table public.price_fetch_jobs (
   request_id  bigint primary key,
   symbol      text not null,
   exchange    text not null,
+  done        boolean not null default false,
   created_at  timestamptz not null default now()
 );
 
@@ -533,7 +543,8 @@ begin
   if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
   for j in execute
     'select f.request_id, f.symbol, f.exchange, r.status_code, r.content
-       from price_fetch_jobs f join net._http_response r on r.id = f.request_id'
+       from price_fetch_jobs f join net._http_response r on r.id = f.request_id
+      where not f.done'
   loop
     begin
       if j.status_code = 200 then
@@ -551,9 +562,8 @@ begin
       end if;
     exception when others then null;  -- skip a bad response, keep the rest
     end;
-    delete from price_fetch_jobs where request_id = j.request_id;
+    update price_fetch_jobs set done = true where request_id = j.request_id;
   end loop;
-  delete from price_fetch_jobs where created_at < now() - interval '1 day';
   return n;
 end $$;
 
@@ -701,8 +711,8 @@ grant  execute on function public.settle_day(timestamptz), public.is_admin(), pu
        public.admin_create_vendor(text, text, text, text), public.admin_set_password(uuid, text),
        public.admin_set_active(uuid, boolean)
   to authenticated;
-revoke execute on function public._create_login(text, text, text, text, text), public.bootstrap_admin(text, text, text, text)
-  from authenticated;
+revoke execute on function public._create_login(text, text, text, text, text), public.bootstrap_admin(text, text, text, text),
+  public.settlement_calc(date) from authenticated;
 
 -- Supabase grants table access to the "anon" role by default; RLS already blocks it, this makes it explicit.
 revoke all on public.profiles, public.accounts, public.requests, public.pnl_entries,

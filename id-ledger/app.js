@@ -147,7 +147,8 @@ async function loadData() {
     inv ? fetchAll('investor_returns', 'created_at') : [],
     inv ? fetchAll('stock_prices', 'price_date') : [],
   ]);
-  S.data = { profiles, accounts, requests, settlements, pnl, ledger, bets, invStocks, invReturns, prices };
+  // a settlement line recalculated to 0 (loss later corrected) is kept in the database but hidden here
+  S.data = { profiles, accounts, requests, settlements: settlements.filter((x) => Number(x.commission) > 0), pnl, ledger, bets, invStocks, invReturns, prices };
   const me = profiles.find((p) => p.id === S.me.id);
   if (me) S.me = me;
 }
