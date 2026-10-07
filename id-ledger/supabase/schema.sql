@@ -49,7 +49,8 @@ create table public.accounts (
   opening_balance  numeric(14,2) not null default 0,
   current_balance  numeric(14,2) not null default 0,
   deposit          numeric(14,2) not null default 0 check (deposit >= 0),   -- money the owner gave the vendor for this ID
-  commission_pct   numeric(5,2)  not null default 10 check (commission_pct between 0 and 100),
+  commission_pct   numeric(5,2)  not null default 10 check (commission_pct between 0 and 100),   -- loss commission
+  upfront_pct      numeric(5,2)  not null default 10 check (upfront_pct >= 0 and upfront_pct < 100),  -- deducted when balance is bought (pay 90%)
   status           text not null default 'active' check (status in ('active','closed')),
   notes            text,
   created_by       uuid,
@@ -69,6 +70,7 @@ begin
     if direct_client and not is_admin() then
       new.vendor_id := auth.uid();
       new.deposit := 0;               -- only the owner records deposits
+      new.upfront_pct := 10;
     end if;
     new.current_balance := new.opening_balance;
     new.created_by := auth.uid();
@@ -81,6 +83,7 @@ begin
     new.opening_balance := old.opening_balance;
     new.current_balance := old.current_balance;
     new.deposit         := old.deposit;
+    new.upfront_pct     := old.upfront_pct;
   elsif new.opening_balance <> old.opening_balance
         and new.current_balance = old.current_balance then
     -- Owner corrected the starting balance: shift the live balance by the same amount.
@@ -150,7 +153,7 @@ begin
   end if;
 
   select vendor_id into v_from_vendor from accounts where id = p_from;
-  select vendor_id, commission_pct into v_to_vendor, v_pct from accounts where id = p_to;
+  select vendor_id, upfront_pct into v_to_vendor, v_pct from accounts where id = p_to;
   if p_kind = 'transfer' and v_from_vendor is distinct from v_to_vendor then
     raise exception 'Both IDs in a transfer must belong to the same vendor';
   end if;

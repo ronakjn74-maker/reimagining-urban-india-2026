@@ -300,7 +300,7 @@ const depCredit = (r) => r.kind === 'deposit' ? Number(r.credit_amount ?? r.amou
 // Commission is taken upfront: for ₹1,00,000 credited at 10% you pay ₹90,000.
 // credited = start balance + completed deposit requests into the ID.
 function idCredit(a) {
-  const pct = Number(a.commission_pct || 0) / 100;
+  const pct = Number(a.upfront_pct ?? 10) / 100;   // upfront deduction, separate from the loss commission %
   const deps = S.data.requests.filter((r) => r.kind === 'deposit' && r.status === 'completed' && r.to_account === a.id);
   const credited = Number(a.opening_balance || 0) + sum(deps, (r) => depCredit(r));
   const paid = Number(a.deposit || 0) + sum(deps, (r) => r.amount);
@@ -402,7 +402,7 @@ function viewDashboard(v) {
       ${kpi('Commission earned', money(sum(S.data.settlements, (s) => s.commission)), `To collect ${money(commDue)} · today ${money(commToday)}`)}
       ${kpi('Pending requests', pending.length, pending.length ? 'Waiting for vendors' : 'All clear')}
       ${kpi('Deposits with vendors', money(depTotal), 'Given − returned')}
-      ${kpi('Short on deposits', overTotal > 0 ? `<span class="neg">${money(overTotal)}</span>` : money(0), overTotal > 0 ? 'You still owe vendors (after 10% upfront)' : 'All IDs paid for')}
+      ${kpi('Short on deposits', overTotal > 0 ? `<span class="neg">${money(overTotal)}</span>` : money(0), overTotal > 0 ? 'You still owe vendors (after the upfront deduction)' : 'All IDs paid for')}
       ${kpi('Upfront commission', money(sum(vs, (x) => x.upfront)), 'Deducted at source on balance credited')}
       ${kpi('Paid to vendors', money(paid), 'Payment ledger')}
       ${kpi('Received from vendors', money(received), 'Payment ledger')}
@@ -525,8 +525,9 @@ function idForm(a = null) {
         <div class="field"><label>Password</label><input name="password" value="${esc(a?.password)}" autocapitalize="none"></div>
         ${!a || admin ? `<div class="field"><label>Start balance ₹</label><input name="opening_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a?.opening_balance ?? '')}" required></div>` : ''}
         ${a && admin ? `<div class="field"><label>Current balance ₹ (correction)</label><input name="current_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a.current_balance)}"></div>` : ''}
+        ${admin ? `<div class="field"><label>Upfront deduction % (you pay the rest)</label><input name="upfront_pct" type="number" step="0.01" min="0" max="99" inputmode="decimal" value="${esc(a?.upfront_pct ?? 10)}"></div>` : ''}
         ${admin ? `<div class="field"><label>Deposit you paid ₹ <span data-dep-hint></span></label><input name="deposit" type="number" step="0.01" min="0" inputmode="decimal" value="${esc(a?.deposit ?? 0)}"></div>` : ''}
-        <div class="field"><label>Commission % on daily loss</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? 10)}" required></div>
+        <div class="field"><label>Loss commission % (on daily loss)</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? 10)}" required></div>
         ${a ? `<div class="field"><label>Status</label><select name="status"><option value="active">Active</option><option value="closed" ${a.status === 'closed' ? 'selected' : ''}>Closed</option></select></div>` : ''}
       </div>
       <div class="field"><label>Notes</label><textarea name="notes">${esc(a?.notes)}</textarea></div>
@@ -539,7 +540,7 @@ function idForm(a = null) {
     ie.deposit?.addEventListener('input', () => { depTouched = true; });
     const depSync = (e) => {
       if (!ie.deposit) return;
-      const bal = Number(ie.opening_balance?.value || 0); const pct = Number(ie.commission_pct.value || 0);
+      const bal = Number(ie.opening_balance?.value || 0); const pct = Number(ie.upfront_pct?.value ?? 10);
       const pay = Math.round(bal * (100 - pct)) / 100;
       $('[data-dep-hint]', root).textContent = `(${100 - pct}% of start balance = ${money(pay)})`;
       if (!depTouched && e?.target !== ie.deposit) ie.deposit.value = bal ? pay : 0;
@@ -556,6 +557,7 @@ function idForm(a = null) {
       if (admin) row.vendor_id = f.vendor_id;
       if ('opening_balance' in f) row.opening_balance = Number(f.opening_balance || 0);
       if ('deposit' in f) row.deposit = Number(f.deposit || 0);
+      if ('upfront_pct' in f) row.upfront_pct = Number(f.upfront_pct || 0);
       if (a && admin && f.current_balance !== '' && Number(f.current_balance) !== Number(a.current_balance)) row.current_balance = Number(f.current_balance);
       busy(e.submitter, async () => {
         if (a) must(await sb.from('accounts').update(row).eq('id', a.id));
@@ -742,7 +744,7 @@ function requestForm(pre = {}) {
       });
       $('[data-lbl-person]', root).textContent = kind === 'withdrawal' ? 'Cash to be given to (name)' : 'Person bringing cash (name)';
       const ta = acc(form.elements.to.value); const amt = Number(form.elements.amount.value || 0);
-      if (kind === 'deposit') { const pct = Number(ta?.commission_pct ?? 10);
+      if (kind === 'deposit') { const pct = Number(ta?.upfront_pct ?? 10);
         const credit = Math.round(amt / (1 - pct / 100) * 100) / 100;
         $('#req-pay-hint', root).textContent = amt ? `ID gets ${money(credit)} – your upfront commission ${money(credit - amt)} (${pct}%)` : `The ID gets your payment + ${pct}% commission (pay 90k → 1 lakh)`; }
     };
@@ -849,18 +851,46 @@ function betItem(b) {
     </div>
     <div class="row between" style="margin-top:6px">
       <span class="small"><span class="pill kind">${b.side.toUpperCase()}</span> ${money(b.stake)} @ <b>${Number(b.odds)}</b></span>
-      ${b.result === 'open' ? `<span class="muted small">win ${signed(betPnl(b.side, b.stake, b.odds, 'won'))} / lose ${signed(betPnl(b.side, b.stake, b.odds, 'lost'))}</span>` : signed(Number(b.pnl))}
+      ${b.result === 'open' ? `<span class="muted small">If ${esc(b.selection || 'it')} wins ${signed(betPnl(b.side, b.stake, b.odds, b.side === 'lay' ? 'lost' : 'won'))} · loses ${signed(betPnl(b.side, b.stake, b.odds, b.side === 'lay' ? 'won' : 'lost'))}</span>` : signed(Number(b.pnl))}
     </div>
     <div class="actions">
-      ${b.result === 'open' ? `<button class="btn sm good" data-bact="won">Won</button><button class="btn sm danger" data-bact="lost">Lost</button><button class="btn sm" data-bact="void">Void</button>` : ''}
+      ${b.result === 'open' ? `<button class="btn sm good" data-bact="won">Bet won</button><button class="btn sm danger" data-bact="lost">Bet lost</button><button class="btn sm" data-bact="void">Void</button>` : ''}
       <button class="btn sm" data-bact="edit">Edit</button>
     </div>
+  </div>`;
+}
+// For each match + selection: total P&L if it wins / loses, plus the loss commission earned from losing IDs.
+function positionSection(open) {
+  const groups = {};
+  open.forEach((b) => { const k = `${(b.event || '').trim().toLowerCase()}|${(b.selection || '').trim().toLowerCase()}`;
+    (groups[k] ||= { event: b.event || '(no event)', selection: b.selection || '(no selection)', bets: [] }).bets.push(b); });
+  const list = Object.values(groups);
+  if (!list.length) return '';
+  return `<div class="section"><div class="section-head"><h2>Position by match</h2></div>
+    <p class="muted small">If the selection wins / loses: total P&L of all open bets, plus the loss commission (each ID's loss × its loss commission %) you earn back.</p>
+    ${list.map((g) => {
+      const ids = {};
+      g.bets.forEach((b) => { const r = (ids[b.account_id] ||= { win: 0, lose: 0 });
+        // selection wins: a back bet is won, a lay bet is lost (and the other way round)
+        r.win += betPnl(b.side, b.stake, b.odds, b.side === 'lay' ? 'lost' : 'won');
+        r.lose += betPnl(b.side, b.stake, b.odds, b.side === 'lay' ? 'won' : 'lost'); });
+      const rows = Object.entries(ids).map(([id, r]) => { const a = acc(id); const pct = Number(a?.commission_pct || 0) / 100;
+        return { a, ...r, cWin: r.win < 0 ? -r.win * pct : 0, cLose: r.lose < 0 ? -r.lose * pct : 0 }; });
+      const T = (k) => sum(rows, (r) => r[k]);
+      return `<div class="table-wrap" style="margin-bottom:12px"><table>
+        <thead><tr><th>${esc(g.event)} – <b>${esc(g.selection)}</b></th><th class="r">If it wins</th><th class="r">If it loses</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr><td>${esc(accName(r.a))} <span class="muted small">${Number(r.a?.commission_pct || 0)}%</span></td><td class="r">${signed(r.win)}</td><td class="r">${signed(r.lose)}</td></tr>`).join('')}</tbody>
+        <tfoot>
+          <tr><td>Bets total</td><td class="r">${signed(T('win'))}</td><td class="r">${signed(T('lose'))}</td></tr>
+          <tr><td>+ Loss commission</td><td class="r">${signed(T('cWin'))}</td><td class="r">${signed(T('cLose'))}</td></tr>
+          <tr><td><b>Net result</b></td><td class="r"><b>${signed(T('win') + T('cWin'))}</b></td><td class="r"><b>${signed(T('lose') + T('cLose'))}</b></td></tr>
+        </tfoot></table></div>`; }).join('')}
   </div>`;
 }
 function betsSection(day) {
   const open = S.data.bets.filter((b) => b.result === 'open');
   const settled = S.data.bets.filter((b) => b.result !== 'open' && b.settle_date === day);
-  return `<div class="section"><div class="section-head"><h2>Open bets (${open.length})</h2></div>
+  return `${positionSection(open)}<div class="section"><div class="section-head"><h2>Open bets (${open.length})</h2></div>
       <div class="list">${open.length ? open.map(betItem).join('') : '<div class="empty">No open bets</div>'}</div></div>
     <div class="section"><div class="section-head"><h2>Settled bets on ${fmtD(day)}</h2><span class="muted small">${signed(sum(settled, (b) => b.pnl))}</span></div>
       <div class="list">${settled.length ? settled.map(betItem).join('') : '<div class="empty">No settled bets this day</div>'}</div></div>`;
