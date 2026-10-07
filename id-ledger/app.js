@@ -246,7 +246,7 @@ function navItems() {
   if (isInvestor()) return [['investors', 'My stocks']];
   return isAdmin()
     ? [['dashboard', 'Dashboard'], ['ids', 'IDs'], ['requests', 'Requests', pend], ['pnl', 'Bets & P&L'], ['commission', 'Commission'], ['ledger', 'Ledger'], ['investors', 'Investors'], ['vendors', 'Vendors']]
-    : [['ids', 'My IDs'], ['requests', 'Requests', pend], ['commission', 'Commission']];
+    : [['ids', 'My IDs'], ['requests', 'Requests', pend], ['commission', 'Commission to pay']];
 }
 function renderShell() {
   $('#app').innerHTML = `
@@ -890,7 +890,7 @@ function viewCommission(v) {
 
   v.innerHTML = `
     <div class="section-head"><h2>Commission</h2></div>
-    <p class="muted small">Commission = each ID's net loss for the day × that ID's commission % (default 10%). Profit days give no commission. The day runs 11:00 AM → 11:00 AM and settles at 11:00 AM.${admin ? ' Collect it by <b>crediting it into the ID</b> or as a <b>withdrawal</b> (cash / bank / UPI) – the vendor accepts it like any request.' : ''}</p>
+    <p class="muted small">${admin ? '' : '<b>Commission is paid to the owner.</b> '}Commission = each ID's net loss for the day × that ID's commission % (default 10%). Profit days give no commission. The day runs 11:00 AM → 11:00 AM and settles at 11:00 AM.${admin ? ' Collect it by <b>crediting it into the ID</b> or as a <b>withdrawal</b> (cash / bank / UPI) – the vendor accepts it like any request.' : ''}</p>
     ${commissionSummary(sets)}
     ${admin ? `<div class="card section">
       <h3 style="margin-bottom:8px">Settle a day</h3>
@@ -948,15 +948,15 @@ function commissionSummary(sets) {
   Object.entries(dayLoss).forEach(([k, v]) => { byId[k.split('|')[0]].loss += v; });
   const rows = Object.values(byId).sort((a, b) => b.earned - a.earned);
   return `<div class="section">
-    <div class="section-head"><h2>Commission earned</h2></div>
+    <div class="section-head"><h2>${isAdmin() ? 'Commission earned' : 'Commission you pay to the owner'}</h2></div>
     <div class="kpis section">
-      ${kpi('Total earned', money(earned), 'All time')}
-      ${kpi('Received', money(recv), 'Credited or paid')}
-      ${kpi('Still to collect', money(earned - recv), 'Due + requested')}
+      ${kpi(isAdmin() ? 'Total earned' : 'Total commission', money(earned), 'All time')}
+      ${kpi(isAdmin() ? 'Received' : 'Already paid', money(recv), isAdmin() ? 'Credited or paid' : 'To the owner')}
+      ${kpi(isAdmin() ? 'Still to collect' : 'Still to pay', money(earned - recv), 'Due + requested')}
       ${kpi('IDs with commission', rows.length)}
     </div>
     ${rows.length ? `<div class="table-wrap"><table>
-      <thead><tr><th>ID</th><th class="r">Loss days</th><th class="r">Total loss</th><th class="r">Earned</th><th class="r">To collect</th></tr></thead>
+      <thead><tr><th>ID</th><th class="r">Loss days</th><th class="r">Total loss</th><th class="r">${isAdmin() ? 'Earned' : 'Commission'}</th><th class="r">${isAdmin() ? 'To collect' : 'To pay'}</th></tr></thead>
       <tbody>${rows.map((r) => `<tr><td style="white-space:normal"><b>${esc(accName(acc(r.account_id)))}</b>${isAdmin() ? `<div class="muted small">${esc(vendorName(r.vendor_id))}</div>` : ''}</td>
         <td class="r">${r.days.size}</td><td class="r">${signed(r.loss)}</td><td class="r num"><b>${money(r.earned)}</b></td><td class="r num">${money(r.earned - r.recv)}</td></tr>`).join('')}</tbody>
       <tfoot><tr><td>Total</td><td></td><td class="r">${signed(sum(rows, (r) => r.loss))}</td><td class="r num">${money(earned)}</td><td class="r num">${money(earned - recv)}</td></tr></tfoot>
