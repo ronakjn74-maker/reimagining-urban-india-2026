@@ -103,7 +103,8 @@ create table public.requests (
   vendor_id          uuid not null references public.profiles(id),
   from_account       uuid references public.accounts(id) on delete cascade,
   to_account         uuid references public.accounts(id) on delete cascade,
-  amount             numeric(14,2) not null check (amount > 0),
+  amount             numeric(14,2) not null check (amount > 0),      -- deposit: money you pay
+  credit_amount      numeric(14,2),   -- deposit: balance added to the ID = amount ÷ (1 − commission %), commission taken upfront
   note               text,
   status             text not null default 'pending'
                      check (status in ('pending','completed','rejected','cancelled')),
@@ -130,7 +131,7 @@ create or replace function public.create_request(
 ) returns bigint
 language plpgsql security definer set search_path = public as $$
 declare
-  v_from_vendor uuid; v_to_vendor uuid; v_vendor uuid; v_id bigint;
+  v_from_vendor uuid; v_to_vendor uuid; v_vendor uuid; v_id bigint; v_pct numeric; v_credit numeric;
 begin
   if not is_admin() then raise exception 'Only the owner can create requests'; end if;
   if p_amount is null or p_amount <= 0 then raise exception 'Amount must be more than 0'; end if;
@@ -149,21 +150,25 @@ begin
   end if;
 
   select vendor_id into v_from_vendor from accounts where id = p_from;
-  select vendor_id into v_to_vendor   from accounts where id = p_to;
+  select vendor_id, commission_pct into v_to_vendor, v_pct from accounts where id = p_to;
   if p_kind = 'transfer' and v_from_vendor is distinct from v_to_vendor then
     raise exception 'Both IDs in a transfer must belong to the same vendor';
   end if;
   v_vendor := coalesce(v_from_vendor, v_to_vendor);
   if v_vendor is null then raise exception 'ID not found'; end if;
+  if p_kind = 'deposit' then
+    -- you pay p_amount; the ID gets it grossed up by the upfront commission (90k at 10% -> 100k)
+    v_credit := coalesce((p_extra->>'credit_amount')::numeric, round(p_amount / (1 - least(coalesce(v_pct, 0), 99) / 100), 2));
+  end if;
   p_extra := coalesce(p_extra, '{}');
   if p_kind = 'transfer' then p_extra := '{}'; end if;
   if p_extra->>'photo_path' is not null and p_extra->>'photo_path' not like v_vendor::text || '/%' then
     raise exception 'Photo must be stored in the vendor folder';
   end if;
 
-  insert into requests (kind, vendor_id, from_account, to_account, amount, note, created_by,
+  insert into requests (kind, vendor_id, from_account, to_account, amount, credit_amount, note, created_by,
                         method, payee_name, payee_phone, token_no, payee_details, photo_path)
-  values (p_kind, v_vendor, p_from, p_to, round(p_amount, 2), nullif(trim(p_note), ''), auth.uid(),
+  values (p_kind, v_vendor, p_from, p_to, round(p_amount, 2), v_credit, nullif(trim(p_note), ''), auth.uid(),
           nullif(p_extra->>'method', ''), nullif(trim(p_extra->>'payee_name'), ''),
           nullif(trim(p_extra->>'payee_phone'), ''), nullif(trim(p_extra->>'token_no'), ''),
           nullif(trim(p_extra->>'payee_details'), ''), nullif(p_extra->>'photo_path', ''))
@@ -194,7 +199,7 @@ begin
        where id = r.from_account returning current_balance into v_from;
     end if;
     if r.to_account is not null then
-      update accounts set current_balance = current_balance + r.amount
+      update accounts set current_balance = current_balance + coalesce(r.credit_amount, r.amount)
        where id = r.to_account returning current_balance into v_to;
     end if;
   end if;

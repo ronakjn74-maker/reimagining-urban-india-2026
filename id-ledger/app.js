@@ -295,6 +295,18 @@ function renderView() {
 }
 
 // ---------- numbers ----------
+// Deposit request: amount = money you pay; credit_amount = balance added to the ID (amount ÷ (1 − commission %)).
+const depCredit = (r) => r.kind === 'deposit' ? Number(r.credit_amount ?? r.amount) : Number(r.amount);
+// Commission is taken upfront: for ₹1,00,000 credited at 10% you pay ₹90,000.
+// credited = start balance + completed deposit requests into the ID.
+function idCredit(a) {
+  const pct = Number(a.commission_pct || 0) / 100;
+  const deps = S.data.requests.filter((r) => r.kind === 'deposit' && r.status === 'completed' && r.to_account === a.id);
+  const credited = Number(a.opening_balance || 0) + sum(deps, (r) => depCredit(r));
+  const paid = Number(a.deposit || 0) + sum(deps, (r) => r.amount);
+  const shouldPay = credited * (1 - pct);
+  return { credited, shouldPay, paid, short: Math.round((shouldPay - paid) * 100) / 100, upfront: credited * pct, pct };
+}
 function vendorStats(vid) {
   const accs = S.data.accounts.filter((a) => a.vendor_id === vid);
   const ids = new Set(accs.map((a) => a.id));
@@ -304,11 +316,14 @@ function vendorStats(vid) {
   const led = all.filter((l) => (l.kind || 'payment') === 'payment');
   const dep = all.filter((l) => l.kind === 'deposit');
   // deposit = deposits written on each ID + any deposit entries in the ledger (given − returned)
-  const deposit = sum(accs.filter((a) => a.status === 'active'), (a) => a.deposit)
+  const act = accs.filter((a) => a.status === 'active'); const cr = act.map(idCredit);
+  const deposit = sum(cr, (c) => c.paid)
     + sum(dep.filter((l) => l.direction === 'out'), (l) => l.amount) - sum(dep.filter((l) => l.direction === 'in'), (l) => l.amount);
-  const balance = sum(accs.filter((a) => a.status === 'active'), (a) => a.current_balance);
+  const shouldPay = sum(cr, (c) => c.shouldPay);
+  const balance = sum(act, (a) => a.current_balance);
   return {
-    deposit, overDeposit: balance - deposit,
+    deposit, shouldPay, credited: sum(cr, (c) => c.credited), upfront: sum(cr, (c) => c.upfront),
+    overDeposit: Math.round((shouldPay - deposit) * 100) / 100,   // > 0 = you still owe the vendor (short)
     count: accs.filter((a) => a.status === 'active').length,
     balance,
     todayPnl: sum(pnl.filter((p) => p.settle_date === day), (p) => p.amount),
@@ -339,7 +354,8 @@ async function requestMessage(r) {
   if (r.kind === 'deposit') lines.push(`Deposit into ID: ${accName(acc(r.to_account))}`);
   if (r.kind === 'withdrawal') lines.push(`Withdraw from ID: ${accName(acc(r.from_account))}`);
   if (r.kind === 'commission') lines.push(r.to_account ? `Credit my commission into ID: ${accName(acc(r.to_account))}` : 'Pay my commission (withdrawal)');
-  lines.push(`Amount: ${money(r.amount)}`);
+  if (r.kind === 'deposit') lines.push(`Money paid: ${money(r.amount)}`, `Add to ID balance: *${money(depCredit(r))}*`);
+  else lines.push(`Amount: ${money(r.amount)}`);
   if (r.method) lines.push(`Method: ${METHOD[r.method]}`);
   if (r.payee_name || r.payee_phone) lines.push(`${isPayout(r) ? 'Cash to be given to' : 'Person'}: ${[r.payee_name, r.payee_phone].filter(Boolean).join(' – ')}`);
   if (r.token_no) lines.push(`Token no: ${r.token_no}`);
@@ -386,7 +402,8 @@ function viewDashboard(v) {
       ${kpi('Commission earned', money(sum(S.data.settlements, (s) => s.commission)), `To collect ${money(commDue)} · today ${money(commToday)}`)}
       ${kpi('Pending requests', pending.length, pending.length ? 'Waiting for vendors' : 'All clear')}
       ${kpi('Deposits with vendors', money(depTotal), 'Given − returned')}
-      ${kpi('ID balance over deposit', overTotal > 0 ? `<span class="neg">${money(overTotal)}</span>` : money(0), overTotal > 0 ? 'Credit vendors are giving you' : 'All IDs covered by deposits')}
+      ${kpi('Short on deposits', overTotal > 0 ? `<span class="neg">${money(overTotal)}</span>` : money(0), overTotal > 0 ? 'You still owe vendors (after 10% upfront)' : 'All IDs paid for')}
+      ${kpi('Upfront commission', money(sum(vs, (x) => x.upfront)), 'Deducted at source on balance credited')}
       ${kpi('Paid to vendors', money(paid), 'Payment ledger')}
       ${kpi('Received from vendors', money(received), 'Payment ledger')}
       ${kpi('Ledger net', signed(received - paid), 'Received − paid')}
@@ -395,13 +412,13 @@ function viewDashboard(v) {
     <div class="section">
       <div class="section-head"><h2>Vendors</h2></div>
       ${vendors().length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Vendor</th><th class="r">IDs</th><th class="r">Balance</th><th class="r">Today P&L</th><th class="r">Total P&L</th><th class="r">Comm. due</th><th class="r">Deposit</th><th class="r">Over deposit</th><th class="r">Paid</th><th class="r">Received</th><th class="r">Pending</th><th></th></tr></thead>
+        <thead><tr><th>Vendor</th><th class="r">IDs</th><th class="r">Balance</th><th class="r">Today P&L</th><th class="r">Total P&L</th><th class="r">Comm. due</th><th class="r">Deposit paid</th><th class="r">Short</th><th class="r">Paid</th><th class="r">Received</th><th class="r">Pending</th><th></th></tr></thead>
         <tbody>${vendors().map((p) => { const s = vendorStats(p.id); return `<tr>
           <td><b>${esc(p.name)}</b>${p.active ? '' : ' <span class="pill closed">off</span>'}</td>
           <td class="r">${s.count}</td><td class="r num">${money(s.balance)}</td>
           <td class="r">${signed(s.todayPnl)}</td><td class="r">${signed(s.totalPnl)}</td>
           <td class="r num">${money(s.commDue)}</td><td class="r num">${money(s.deposit)}</td>
-          <td class="r">${s.overDeposit > 0 ? `<span class="neg num">${money(s.overDeposit)}</span>` : `<span class="pos num">cover ${money(-s.overDeposit)}</span>`}</td>
+          <td class="r">${s.overDeposit > 0 ? `<span class="neg num">${money(s.overDeposit)}</span>` : s.overDeposit < 0 ? `<span class="pos num">extra ${money(-s.overDeposit)}</span>` : '<span class="pos">✓</span>'}</td>
           <td class="r num">${money(s.paid)}</td><td class="r num">${money(s.received)}</td>
           <td class="r">${s.pending.length || ''}</td>
           <td><button class="btn sm wa" data-remind="${p.id}" ${p.phone ? '' : 'disabled title="Add phone in Vendors"'}>${s.pending.length ? 'Remind' : 'WhatsApp'}</button></td>
@@ -460,8 +477,8 @@ function drawIdList() {
       <div class="row between">
         <div><div class="muted small">Current balance</div><div class="big">${money(a.current_balance)}</div></div>
         <div style="text-align:right"><div class="muted small">Start ${money(a.opening_balance)}</div>
-          ${isAdmin() ? (() => { const over = Number(a.current_balance) - Number(a.deposit || 0); return `<div class="small">Deposit <b>${money(a.deposit || 0)}</b></div>
-          <div class="small">${over > 0 ? `<span class="neg">Over deposit ${money(over)}</span>` : `<span class="pos">Cover left ${money(-over)}</span>`}</div>`; })() : ''}
+          ${isAdmin() ? (() => { const c = idCredit(a); return `<div class="small">Pay ${Math.round((1 - c.pct) * 100)}%: <b>${money(c.shouldPay)}</b> · Paid <b>${money(c.paid)}</b></div>
+          <div class="small">${c.short > 0 ? `<span class="neg">Short ${money(c.short)}</span>` : c.short < 0 ? `<span class="pos">Paid extra ${money(-c.short)}</span>` : '<span class="pos">Fully paid</span>'} · Upfront comm. ${money(c.upfront)}</div>`; })() : ''}
           <div class="small">Commission <b>${Number(a.commission_pct)}%</b></div>
           ${isAdmin() && today ? `<div class="small">Today ${signed(today)}</div>` : ''}</div>
       </div>
@@ -508,7 +525,7 @@ function idForm(a = null) {
         <div class="field"><label>Password</label><input name="password" value="${esc(a?.password)}" autocapitalize="none"></div>
         ${!a || admin ? `<div class="field"><label>Start balance ₹</label><input name="opening_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a?.opening_balance ?? '')}" required></div>` : ''}
         ${a && admin ? `<div class="field"><label>Current balance ₹ (correction)</label><input name="current_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a.current_balance)}"></div>` : ''}
-        ${admin ? `<div class="field"><label>Deposit for this ID ₹ (money you gave)</label><input name="deposit" type="number" step="0.01" min="0" inputmode="decimal" value="${esc(a?.deposit ?? 0)}"></div>` : ''}
+        ${admin ? `<div class="field"><label>Deposit you paid ₹ <span data-dep-hint></span></label><input name="deposit" type="number" step="0.01" min="0" inputmode="decimal" value="${esc(a?.deposit ?? 0)}"></div>` : ''}
         <div class="field"><label>Commission % on daily loss</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? 10)}" required></div>
         ${a ? `<div class="field"><label>Status</label><select name="status"><option value="active">Active</option><option value="closed" ${a.status === 'closed' ? 'selected' : ''}>Closed</option></select></div>` : ''}
       </div>
@@ -517,6 +534,17 @@ function idForm(a = null) {
       <button class="btn primary block" type="submit">${a ? 'Save' : 'Add ID'}</button>
       ${a && admin ? `<button class="btn danger block" type="button" id="del-id" style="margin-top:8px">Delete ID and its history</button>` : ''}
     </form>`, (root) => {
+    const idf = $('#id-form', root); const ie = idf.elements;
+    let depTouched = !!(a && Number(a.deposit));
+    ie.deposit?.addEventListener('input', () => { depTouched = true; });
+    const depSync = (e) => {
+      if (!ie.deposit) return;
+      const bal = Number(ie.opening_balance?.value || 0); const pct = Number(ie.commission_pct.value || 0);
+      const pay = Math.round(bal * (100 - pct)) / 100;
+      $('[data-dep-hint]', root).textContent = `(${100 - pct}% of start balance = ${money(pay)})`;
+      if (!depTouched && e?.target !== ie.deposit) ie.deposit.value = bal ? pay : 0;
+    };
+    idf.addEventListener('input', depSync); depSync();
     $('#id-form', root).onsubmit = (e) => {
       e.preventDefault();
       const f = formObj(e.target);
@@ -548,7 +576,7 @@ function statement(a) {
     const out = r.from_account === a.id;
     const other = r.kind === 'transfer' ? ` ${out ? '→' : '←'} ${accName(acc(out ? r.to_account : r.from_account))}` : '';
     rows.push({ t: r.responded_at || r.created_at, label: `#${r.id} ${KIND[r.kind]}${other}${r.method ? ` · ${METHOD[r.method]}` : ''}`,
-      amt: r.status === 'completed' ? (out ? -r.amount : +r.amount) : null, raw: r.amount, status: r.status,
+      amt: r.status === 'completed' ? (out ? -r.amount : +depCredit(r)) : null, raw: out ? r.amount : depCredit(r), status: r.status,
       after: r.status === 'completed' ? (out ? r.from_balance_after : r.to_balance_after) : null });
   });
   if (isAdmin()) S.data.pnl.filter((p) => p.account_id === a.id).forEach((p) =>
@@ -595,7 +623,7 @@ function requestCard(r) {
   const needsDetails = r.method && r.method !== 'cash' && !r.payee_details;
   return `<div class="item" data-req="${r.id}">
     <div class="row between">
-      <div class="row"><span class="pill kind">${KIND[r.kind]}</span><b>#${r.id}</b><span class="big" style="font-size:1.1rem">${money(r.amount)}</span></div>
+      <div class="row"><span class="pill kind">${KIND[r.kind]}</span><b>#${r.id}</b><span class="big" style="font-size:1.1rem">${money(r.kind === 'deposit' ? depCredit(r) : r.amount)}</span>${r.kind === 'deposit' ? `<span class="muted small">paid ${money(r.amount)}</span>` : ''}</div>
       <span class="pill ${r.status}">${r.status}</span>
     </div>
     <dl class="kv" style="margin-top:8px">
@@ -640,7 +668,7 @@ function bindRequestCards(root) {
 function respondForm(r, accept) {
   openModal(`${accept ? 'Complete' : 'Reject'} request #${r.id}`, `
     <form id="resp-form">
-      <p>${KIND[r.kind]} of <b>${money(r.amount)}</b>${r.kind === 'transfer' ? ` from ${esc(accName(acc(r.from_account)))} to ${esc(accName(acc(r.to_account)))}`
+      <p>${KIND[r.kind]} of <b>${money(r.kind === 'deposit' ? depCredit(r) : r.amount)}</b>${r.kind === 'transfer' ? ` from ${esc(accName(acc(r.from_account)))} to ${esc(accName(acc(r.to_account)))}`
         : r.kind === 'commission' && !r.to_account ? ' paid out (cash / bank / UPI)'
         : ` ${r.kind === 'withdrawal' ? 'from' : 'into'} ${esc(accName(acc(r.from_account || r.to_account)))}`}.</p>
       ${accept ? `<p class="muted small">${r.from_account || r.to_account ? `The ID balance${r.kind === 'transfer' ? 's' : ''} will update immediately.` : 'No ID balance changes.'}</p>
@@ -679,11 +707,12 @@ function requestForm(pre = {}) {
   const vid = pre.vendor || vendors()[0].id;
   openModal('New request', `
     <form id="req-form">
-      <div class="field"><div class="seg" id="rk">${Object.entries(KIND).map(([k, l], i) => `<label><input type="radio" name="kind" value="${k}" ${i === 0 ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>
+      <div class="field"><div class="seg" id="rk">${Object.entries(KIND).filter(([k]) => k !== 'commission').map(([k, l], i) => `<label><input type="radio" name="kind" value="${k}" ${i === 0 ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>
       <div class="field"><label>Vendor</label><select name="vendor">${vendors().map((p) => `<option value="${p.id}" ${p.id === vid ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
       <div class="field" data-show="transfer withdrawal"><label>From ID</label><select name="from">${accountOptions(vid, pre.from)}</select></div>
       <div class="field" data-show="transfer deposit"><label>To ID</label><select name="to">${accountOptions(vid, pre.to)}</select></div>
-      <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+      <div class="field"><label>Amount ₹ <span class="muted" data-show="deposit">(money you pay)</span></label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required>
+        <div class="muted small" data-show="deposit" id="req-pay-hint" style="margin-top:4px"></div></div>
       <div class="field" data-show="deposit withdrawal"><label>Method</label>
         <select name="method">${Object.entries(METHOD).map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select></div>
       <div data-show="cash">
@@ -712,7 +741,12 @@ function requestForm(pre = {}) {
         el.classList.toggle('hidden', !show);
       });
       $('[data-lbl-person]', root).textContent = kind === 'withdrawal' ? 'Cash to be given to (name)' : 'Person bringing cash (name)';
+      const ta = acc(form.elements.to.value); const amt = Number(form.elements.amount.value || 0);
+      if (kind === 'deposit') { const pct = Number(ta?.commission_pct ?? 10);
+        const credit = Math.round(amt / (1 - pct / 100) * 100) / 100;
+        $('#req-pay-hint', root).textContent = amt ? `ID gets ${money(credit)} – your upfront commission ${money(credit - amt)} (${pct}%)` : `The ID gets your payment + ${pct}% commission (pay 90k → 1 lakh)`; }
     };
+    form.addEventListener('input', sync);
     form.addEventListener('change', (e) => {
       if (e.target.name === 'vendor') { const el = form.elements; el.from.innerHTML = accountOptions(el.vendor.value); el.to.innerHTML = accountOptions(el.vendor.value); }
       sync();
@@ -1058,7 +1092,7 @@ function viewLedger(v) {
     <div class="toolbar"><select id="led-vendor"><option value="">All vendors</option><option value="none" ${S.f.ledVendor === 'none' ? 'selected' : ''}>No vendor</option>${vendors().map((p) => `<option value="${p.id}" ${S.f.ledVendor === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
     <div class="kpis section">
       ${kpi('Deposit held by vendor', money(depHeld), 'Deposit given − returned')}
-      ${vsel ? kpi('ID balance vs deposit', vsel.overDeposit > 0 ? `<span class="neg">+${money(vsel.overDeposit)}</span>` : `<span class="pos">${money(-vsel.overDeposit)} cover</span>`, `ID balance ${money(vsel.balance)}`) : ''}
+      ${vsel ? kpi('Deposit short / extra', vsel.overDeposit > 0 ? `<span class="neg">Short ${money(vsel.overDeposit)}</span>` : `<span class="pos">Extra ${money(-vsel.overDeposit)}</span>`, `Should pay ${money(vsel.shouldPay)} for ${money(vsel.credited)} credited`) : ''}
       ${kpi('Paid out', money(paid), 'Payments only')}${kpi('Received', money(recv), 'Payments only')}${kpi('Net', signed(recv - paid), 'Received − paid')}
     </div>
     ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Vendor</th><th>Type</th><th>Mode</th><th class="r">Amount</th><th>Ref / note</th><th></th></tr></thead><tbody>
@@ -1459,7 +1493,7 @@ function viewVendors(v) {
       <div class="row between"><div><h3>${esc(p.name)}</h3><div class="muted small">Login: <span class="secret">${esc(p.username)}</span>${p.phone ? ` · ${esc(p.phone)}` : ''}</div></div>
         <span class="pill ${p.active ? 'active' : 'closed'}">${p.active ? 'active' : 'off'}</span></div>
       <div class="small" style="margin-top:6px">${s.count} IDs · Balance ${money(s.balance)} · Pending ${s.pending.length} · Comm. due ${money(s.commDue)}</div>
-      <div class="small" style="margin-top:4px">Deposit ${money(s.deposit)} · ${s.overDeposit > 0 ? `<b class="neg">Over deposit ${money(s.overDeposit)}</b> (extra ID balance given on credit)` : `<span class="pos">Deposit cover left ${money(-s.overDeposit)}</span>`}</div>
+      <div class="small" style="margin-top:4px">Credited ${money(s.credited)} · Should pay ${money(s.shouldPay)} · Paid ${money(s.deposit)} · ${s.overDeposit > 0 ? `<b class="neg">Short ${money(s.overDeposit)}</b> (balance taken on credit)` : s.overDeposit < 0 ? `<span class="pos">Paid extra ${money(-s.overDeposit)}</span>` : '<span class="pos">Fully paid</span>'} · Upfront comm. ${money(s.upfront)}</div>
       <div class="actions">
         <button class="btn sm wa" data-vact="wa" ${p.phone ? '' : 'disabled'}>${s.pending.length ? 'Remind pending' : 'WhatsApp'}</button>
         <button class="btn sm" data-vact="edit">Edit</button>
