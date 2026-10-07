@@ -417,6 +417,7 @@ create table public.ledger (
   id          bigint generated always as identity primary key,
   entry_date  date not null default ((now() at time zone 'Asia/Kolkata')::date),
   vendor_id   uuid references public.profiles(id) on delete set null,
+  kind        text not null default 'payment' check (kind in ('payment','deposit')),  -- deposit = security deposit with the vendor
   direction   text not null check (direction in ('out','in')),  -- out = I paid, in = I received
   amount      numeric(14,2) not null check (amount > 0),
   mode        text,

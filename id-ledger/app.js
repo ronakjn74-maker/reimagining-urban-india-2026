@@ -300,10 +300,15 @@ function vendorStats(vid) {
   const ids = new Set(accs.map((a) => a.id));
   const pnl = S.data.pnl.filter((p) => ids.has(p.account_id));
   const day = settleDay();
-  const led = S.data.ledger.filter((l) => l.vendor_id === vid);
+  const all = S.data.ledger.filter((l) => l.vendor_id === vid);
+  const led = all.filter((l) => (l.kind || 'payment') === 'payment');
+  const dep = all.filter((l) => l.kind === 'deposit');
+  const deposit = sum(dep.filter((l) => l.direction === 'out'), (l) => l.amount) - sum(dep.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const balance = sum(accs.filter((a) => a.status === 'active'), (a) => a.current_balance);
   return {
+    deposit, overDeposit: balance - deposit,
     count: accs.filter((a) => a.status === 'active').length,
-    balance: sum(accs.filter((a) => a.status === 'active'), (a) => a.current_balance),
+    balance,
     todayPnl: sum(pnl.filter((p) => p.settle_date === day), (p) => p.amount),
     totalPnl: sum(pnl, (p) => p.amount),
     commDue: sum(S.data.settlements.filter((s) => s.vendor_id === vid && s.status !== 'received'), (s) => s.commission),
@@ -364,8 +369,11 @@ function viewDashboard(v) {
   const totalPnl = sum(S.data.pnl, (p) => p.amount);
   const commDue = sum(S.data.settlements.filter((s) => s.status !== 'received'), (s) => s.commission);
   const commToday = sum(commissionPreview(day), (c) => c.commission);
-  const paid = sum(S.data.ledger.filter((l) => l.direction === 'out'), (l) => l.amount);
-  const received = sum(S.data.ledger.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const payments = S.data.ledger.filter((l) => (l.kind || 'payment') === 'payment');
+  const paid = sum(payments.filter((l) => l.direction === 'out'), (l) => l.amount);
+  const received = sum(payments.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const vs = vendors().map((p) => vendorStats(p.id));
+  const depTotal = sum(vs, (x) => x.deposit); const overTotal = sum(vs.filter((x) => x.overDeposit > 0), (x) => x.overDeposit);
   const pending = S.data.requests.filter((r) => r.status === 'pending');
 
   v.innerHTML = `
@@ -375,6 +383,8 @@ function viewDashboard(v) {
       ${kpi('Total P&L', signed(totalPnl), 'All time')}
       ${kpi('Commission earned', money(sum(S.data.settlements, (s) => s.commission)), `To collect ${money(commDue)} · today ${money(commToday)}`)}
       ${kpi('Pending requests', pending.length, pending.length ? 'Waiting for vendors' : 'All clear')}
+      ${kpi('Deposits with vendors', money(depTotal), 'Given − returned')}
+      ${kpi('ID balance over deposit', overTotal > 0 ? `<span class="neg">${money(overTotal)}</span>` : money(0), overTotal > 0 ? 'Credit vendors are giving you' : 'All IDs covered by deposits')}
       ${kpi('Paid to vendors', money(paid), 'Payment ledger')}
       ${kpi('Received from vendors', money(received), 'Payment ledger')}
       ${kpi('Ledger net', signed(received - paid), 'Received − paid')}
@@ -383,12 +393,14 @@ function viewDashboard(v) {
     <div class="section">
       <div class="section-head"><h2>Vendors</h2></div>
       ${vendors().length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Vendor</th><th class="r">IDs</th><th class="r">Balance</th><th class="r">Today P&L</th><th class="r">Total P&L</th><th class="r">Comm. due</th><th class="r">Paid</th><th class="r">Received</th><th class="r">Pending</th><th></th></tr></thead>
+        <thead><tr><th>Vendor</th><th class="r">IDs</th><th class="r">Balance</th><th class="r">Today P&L</th><th class="r">Total P&L</th><th class="r">Comm. due</th><th class="r">Deposit</th><th class="r">Over deposit</th><th class="r">Paid</th><th class="r">Received</th><th class="r">Pending</th><th></th></tr></thead>
         <tbody>${vendors().map((p) => { const s = vendorStats(p.id); return `<tr>
           <td><b>${esc(p.name)}</b>${p.active ? '' : ' <span class="pill closed">off</span>'}</td>
           <td class="r">${s.count}</td><td class="r num">${money(s.balance)}</td>
           <td class="r">${signed(s.todayPnl)}</td><td class="r">${signed(s.totalPnl)}</td>
-          <td class="r num">${money(s.commDue)}</td><td class="r num">${money(s.paid)}</td><td class="r num">${money(s.received)}</td>
+          <td class="r num">${money(s.commDue)}</td><td class="r num">${money(s.deposit)}</td>
+          <td class="r">${s.overDeposit > 0 ? `<span class="neg num">${money(s.overDeposit)}</span>` : `<span class="pos num">cover ${money(-s.overDeposit)}</span>`}</td>
+          <td class="r num">${money(s.paid)}</td><td class="r num">${money(s.received)}</td>
           <td class="r">${s.pending.length || ''}</td>
           <td><button class="btn sm wa" data-remind="${p.id}" ${p.phone ? '' : 'disabled title="Add phone in Vendors"'}>${s.pending.length ? 'Remind' : 'WhatsApp'}</button></td>
         </tr>`; }).join('')}</tbody></table></div>` : `<div class="empty">No vendors yet. Create one in <b>Vendors</b>.</div>`}
@@ -1030,17 +1042,22 @@ function commTable(rows, actions) {
 function viewLedger(v) {
   if (!isAdmin()) return viewIds(v);
   const rows = S.data.ledger.filter((l) => !S.f.ledVendor || (S.f.ledVendor === 'none' ? !l.vendor_id : l.vendor_id === S.f.ledVendor));
-  const paid = sum(rows.filter((l) => l.direction === 'out'), (l) => l.amount);
-  const recv = sum(rows.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const pay = rows.filter((l) => (l.kind || 'payment') === 'payment'); const dep = rows.filter((l) => l.kind === 'deposit');
+  const paid = sum(pay.filter((l) => l.direction === 'out'), (l) => l.amount);
+  const recv = sum(pay.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const depHeld = sum(dep.filter((l) => l.direction === 'out'), (l) => l.amount) - sum(dep.filter((l) => l.direction === 'in'), (l) => l.amount);
+  const vsel = S.f.ledVendor && S.f.ledVendor !== 'none' ? vendorStats(S.f.ledVendor) : null;
   v.innerHTML = `
-    <div class="section-head"><h2>Payment ledger</h2><button class="btn primary" id="add-led">+ Add payment</button></div>
+    <div class="section-head"><h2>Payment ledger</h2><button class="btn primary" id="add-led">+ Payment / deposit</button></div>
     <div class="toolbar"><select id="led-vendor"><option value="">All vendors</option><option value="none" ${S.f.ledVendor === 'none' ? 'selected' : ''}>No vendor</option>${vendors().map((p) => `<option value="${p.id}" ${S.f.ledVendor === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
     <div class="kpis section">
-      ${kpi('Paid out', money(paid))}${kpi('Received', money(recv))}${kpi('Net', signed(recv - paid), 'Received − paid')}${kpi('Entries', rows.length)}
+      ${kpi('Deposit held by vendor', money(depHeld), 'Deposit given − returned')}
+      ${vsel ? kpi('ID balance vs deposit', vsel.overDeposit > 0 ? `<span class="neg">+${money(vsel.overDeposit)}</span>` : `<span class="pos">${money(-vsel.overDeposit)} cover</span>`, `ID balance ${money(vsel.balance)}`) : ''}
+      ${kpi('Paid out', money(paid), 'Payments only')}${kpi('Received', money(recv), 'Payments only')}${kpi('Net', signed(recv - paid), 'Received − paid')}
     </div>
     ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Vendor</th><th>Type</th><th>Mode</th><th class="r">Amount</th><th>Ref / note</th><th></th></tr></thead><tbody>
       ${rows.map((l) => `<tr><td>${fmtD(l.entry_date)}</td><td>${esc(l.vendor_id ? vendorName(l.vendor_id) : '—')}</td>
-        <td>${l.direction === 'out' ? '<span class="neg">Paid</span>' : '<span class="pos">Received</span>'}</td><td>${esc(l.mode)}</td>
+        <td>${l.kind === 'deposit' ? `<span class="pill kind">Deposit ${l.direction === 'out' ? 'given' : 'returned'}</span>` : l.direction === 'out' ? '<span class="neg">Paid</span>' : '<span class="pos">Received</span>'}</td><td>${esc(l.mode)}</td>
         <td class="r">${signed(l.direction === 'out' ? -l.amount : +l.amount)}</td><td>${esc([l.reference, l.note].filter(Boolean).join(' · '))}</td>
         <td><button class="icon-btn" data-del-led="${l.id}" title="Delete">🗑</button></td></tr>`).join('')}
     </tbody></table></div>` : '<div class="empty">No payments recorded</div>'}`;
@@ -1052,9 +1069,10 @@ function viewLedger(v) {
   });
 }
 function ledgerForm() {
-  openModal('Add payment', `
+  openModal('Add payment / deposit', `
     <form id="led-form">
-      <div class="field"><div class="seg"><label><input type="radio" name="direction" value="out" checked><span>I paid</span></label><label><input type="radio" name="direction" value="in"><span>I received</span></label></div></div>
+      <div class="field"><label>Type</label><div class="seg"><label><input type="radio" name="kind" value="payment" checked><span>Payment</span></label><label><input type="radio" name="kind" value="deposit"><span>Deposit</span></label></div></div>
+      <div class="field"><div class="seg"><label><input type="radio" name="direction" value="out" checked><span data-dl="out">I paid</span></label><label><input type="radio" name="direction" value="in"><span data-dl="in">I received</span></label></div></div>
       <div class="fields two">
         <div class="field"><label>Date</label><input name="entry_date" type="date" value="${todayIST()}" required></div>
         <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
@@ -1065,9 +1083,14 @@ function ledgerForm() {
       <div class="field"><label>Note</label><input name="note"></div>
       <button class="btn primary block">Save</button>
     </form>`, (root) => {
+    const lf = $('#led-form', root);
+    const syncL = () => { const d = lf.elements.kind.value === 'deposit';
+      $('[data-dl="out"]', root).textContent = d ? 'Deposit given' : 'I paid'; $('[data-dl="in"]', root).textContent = d ? 'Deposit returned' : 'I received'; };
+    lf.addEventListener('change', syncL); syncL();
     $('#led-form', root).onsubmit = (e) => {
       e.preventDefault(); const f = formObj(e.target);
       busy(e.submitter, async () => {
+        if (f.kind === 'deposit' && !f.vendor_id) throw new Error('Choose the vendor for a deposit');
         must(await sb.from('ledger').insert({ ...f, amount: Number(f.amount), vendor_id: f.vendor_id || null, reference: f.reference || null, note: f.note || null }));
         modal.close(); toast('Payment saved'); scheduleReload();
       });
@@ -1144,7 +1167,6 @@ function viewInvestors(v) {
   const cashOut = rets.filter((x) => x.mode === 'cash');
   const totIn = sum(moneyIn, (x) => x.amount); const totOut = sum(cashOut, (x) => x.amount);
   const byKind = (k) => sum(moneyIn.filter((x) => (x.kind || 'cash') === k), (x) => x.amount);
-  const toReceive = sum(rows, (r) => r.leftQty * r.avgRate);
   const moneyRows = [
     ...moneyIn.map((x) => ({ kind: 'in', date: x.paid_on, amount: Number(x.amount), x })),
     ...cashOut.map((x) => ({ kind: 'out', date: x.paid_on, amount: Number(x.amount), x })),
@@ -1178,7 +1200,9 @@ function viewInvestors(v) {
         ${kpi(L.in, signed(totIn), `Shares ${money(byKind('shares'))} · Cash ${money(byKind('cash'))} · Other ${money(byKind('other'))}`)}
         ${kpi(L.out, signed(-totOut), `${cashOut.length} payment${cashOut.length === 1 ? '' : 's'}`)}
         ${kpi('Net', signed(totIn - totOut), admin ? 'Received − paid' : 'Sent − received back')}
-        ${kpi(admin ? 'Shares left – still to receive' : 'Shares left – still to send', money(Math.max(0, toReceive)), 'Shares not yet sent as money × sell rate')}
+        ${(() => { const diff = tot.received - totIn; return diff >= 0
+          ? kpi(admin ? 'Still to receive from him' : 'Still to send', money(diff), `Shares sold ${money(tot.received)} − all money ${admin ? 'received' : 'sent'}`)
+          : kpi(admin ? 'Received more' : 'Sent more', `<span class="pos">${money(-diff)}</span>`, `More than the shares' value ${money(tot.received)}`); })()}
       </div>
       ${moneyRows.length ? `<div class="list">${moneyRows.map((m) => `<div class="item row between">
         <div><b class="${m.kind === 'in' ? 'pos' : 'neg'}">${m.kind === 'in' ? L.in : L.out}</b>
@@ -1194,7 +1218,7 @@ function viewInvestors(v) {
           <span class="big" style="font-size:1.1rem">${r.due != null ? money(r.due) : '—'}</span></div>
         <dl class="kv" style="margin-top:6px">
           <dt>Sold</dt><dd>${qtyFmt(r.soldQty)} @ ${money(r.avgRate)} = ${money(r.received)}</dd>
-          <dt>Money sent</dt><dd>${r.sentQty ? `${qtyFmt(r.sentQty)} shares → ${money(r.sentValue)}` : '—'}</dd>
+          <dt>Money sent</dt><dd>${r.sentQty ? `${qtyFmt(r.sentQty)} shares → ${money(r.sentValue)}${r.sentValue - r.sentQty * r.avgRate > 0.5 ? ` <span class="pos small">(${money(r.sentValue - r.sentQty * r.avgRate)} more than sell rate)</span>` : ''}` : '—'}</dd>
           <dt>Shares left</dt><dd><b class="${r.leftQty ? 'neg' : 'pos'}">${qtyFmt(r.leftQty)}</b> <span class="muted small">${r.leftQty ? `≈ ${money(r.leftQty * r.avgRate)} not sent yet` : 'all sent'}</span></dd>
           ${r.retQty ? `<dt>Returned</dt><dd>${qtyFmt(r.retQty)} shares (${money(r.retValue)})</dd>` : ''}
           <dt>Still owed</dt><dd><b>${qtyFmt(r.owed)} shares</b></dd>
@@ -1430,6 +1454,7 @@ function viewVendors(v) {
       <div class="row between"><div><h3>${esc(p.name)}</h3><div class="muted small">Login: <span class="secret">${esc(p.username)}</span>${p.phone ? ` · ${esc(p.phone)}` : ''}</div></div>
         <span class="pill ${p.active ? 'active' : 'closed'}">${p.active ? 'active' : 'off'}</span></div>
       <div class="small" style="margin-top:6px">${s.count} IDs · Balance ${money(s.balance)} · Pending ${s.pending.length} · Comm. due ${money(s.commDue)}</div>
+      <div class="small" style="margin-top:4px">Deposit ${money(s.deposit)} · ${s.overDeposit > 0 ? `<b class="neg">Over deposit ${money(s.overDeposit)}</b> (extra ID balance given on credit)` : `<span class="pos">Deposit cover left ${money(-s.overDeposit)}</span>`}</div>
       <div class="actions">
         <button class="btn sm wa" data-vact="wa" ${p.phone ? '' : 'disabled'}>${s.pending.length ? 'Remind pending' : 'WhatsApp'}</button>
         <button class="btn sm" data-vact="edit">Edit</button>
