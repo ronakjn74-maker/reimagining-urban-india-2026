@@ -526,6 +526,10 @@ create trigger investor_stocks_norm before insert or update on public.investor_s
 create table public.investor_money (
   id           bigint generated always as identity primary key,
   investor_id  uuid not null references public.profiles(id) on delete cascade,
+  kind         text not null default 'cash' check (kind in ('shares','cash','other')),  -- shares = money from selling a stock
+  symbol       text,                                   -- kind = shares: which stock …
+  exchange     text check (exchange in ('NSE','BSE')),
+  qty          numeric(14,4),                          -- … and how many shares were sold
   amount       numeric(14,2) not null check (amount > 0),
   paid_on      date not null default ((now() at time zone 'Asia/Kolkata')::date),
   mode         text,
@@ -535,6 +539,29 @@ create table public.investor_money (
   created_at   timestamptz not null default now()
 );
 create index on public.investor_money (investor_id);
+
+create or replace function public.investor_money_check() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare listed numeric; sent numeric;
+begin
+  if new.kind <> 'shares' then
+    new.symbol := null; new.exchange := null; new.qty := null;
+    return new;
+  end if;
+  new.symbol := upper(trim(new.symbol)); new.exchange := coalesce(new.exchange, 'NSE');
+  if new.symbol is null or coalesce(new.qty, 0) <= 0 then raise exception 'Choose the share and how many were sold'; end if;
+  select coalesce(sum(qty), 0) into listed from investor_stocks
+   where investor_id = new.investor_id and symbol = new.symbol and exchange = new.exchange;
+  select coalesce(sum(qty), 0) into sent from investor_money
+   where investor_id = new.investor_id and kind = 'shares' and symbol = new.symbol and exchange = new.exchange
+     and id is distinct from new.id;
+  if new.qty > listed - sent + 0.0001 then
+    raise exception 'Only % % shares are left', trim(to_char(listed - sent, 'FM999999990.####')), new.symbol;
+  end if;
+  return new;
+end $$;
+create trigger investor_money_check before insert or update on public.investor_money
+  for each row execute function public.investor_money_check();
 
 -- Daily closing prices (filled automatically; owner can type a price, which is never overwritten).
 create table public.stock_prices (
