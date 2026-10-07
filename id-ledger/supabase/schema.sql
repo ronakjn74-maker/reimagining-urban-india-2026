@@ -48,6 +48,7 @@ create table public.accounts (
   password         text,
   opening_balance  numeric(14,2) not null default 0,
   current_balance  numeric(14,2) not null default 0,
+  deposit          numeric(14,2) not null default 0 check (deposit >= 0),   -- money the owner gave the vendor for this ID
   commission_pct   numeric(5,2)  not null default 10 check (commission_pct between 0 and 100),
   status           text not null default 'active' check (status in ('active','closed')),
   notes            text,
@@ -67,6 +68,7 @@ begin
   if tg_op = 'INSERT' then
     if direct_client and not is_admin() then
       new.vendor_id := auth.uid();
+      new.deposit := 0;               -- only the owner records deposits
     end if;
     new.current_balance := new.opening_balance;
     new.created_by := auth.uid();
@@ -78,6 +80,7 @@ begin
     new.vendor_id       := old.vendor_id;
     new.opening_balance := old.opening_balance;
     new.current_balance := old.current_balance;
+    new.deposit         := old.deposit;
   elsif new.opening_balance <> old.opening_balance
         and new.current_balance = old.current_balance then
     -- Owner corrected the starting balance: shift the live balance by the same amount.

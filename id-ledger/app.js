@@ -303,7 +303,9 @@ function vendorStats(vid) {
   const all = S.data.ledger.filter((l) => l.vendor_id === vid);
   const led = all.filter((l) => (l.kind || 'payment') === 'payment');
   const dep = all.filter((l) => l.kind === 'deposit');
-  const deposit = sum(dep.filter((l) => l.direction === 'out'), (l) => l.amount) - sum(dep.filter((l) => l.direction === 'in'), (l) => l.amount);
+  // deposit = deposits written on each ID + any deposit entries in the ledger (given − returned)
+  const deposit = sum(accs.filter((a) => a.status === 'active'), (a) => a.deposit)
+    + sum(dep.filter((l) => l.direction === 'out'), (l) => l.amount) - sum(dep.filter((l) => l.direction === 'in'), (l) => l.amount);
   const balance = sum(accs.filter((a) => a.status === 'active'), (a) => a.current_balance);
   return {
     deposit, overDeposit: balance - deposit,
@@ -458,6 +460,8 @@ function drawIdList() {
       <div class="row between">
         <div><div class="muted small">Current balance</div><div class="big">${money(a.current_balance)}</div></div>
         <div style="text-align:right"><div class="muted small">Start ${money(a.opening_balance)}</div>
+          ${isAdmin() ? (() => { const over = Number(a.current_balance) - Number(a.deposit || 0); return `<div class="small">Deposit <b>${money(a.deposit || 0)}</b></div>
+          <div class="small">${over > 0 ? `<span class="neg">Over deposit ${money(over)}</span>` : `<span class="pos">Cover left ${money(-over)}</span>`}</div>`; })() : ''}
           <div class="small">Commission <b>${Number(a.commission_pct)}%</b></div>
           ${isAdmin() && today ? `<div class="small">Today ${signed(today)}</div>` : ''}</div>
       </div>
@@ -502,8 +506,9 @@ function idForm(a = null) {
         <div class="field"><label>Login link</label><input name="login_url" value="${esc(a?.login_url)}" inputmode="url" placeholder="https://…"></div>
         <div class="field"><label>ID / username *</label><input name="username" value="${esc(a?.username)}" required autocapitalize="none"></div>
         <div class="field"><label>Password</label><input name="password" value="${esc(a?.password)}" autocapitalize="none"></div>
-        ${!a || admin ? `<div class="field"><label>Start balance (deposit) ₹</label><input name="opening_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a?.opening_balance ?? '')}" required></div>` : ''}
+        ${!a || admin ? `<div class="field"><label>Start balance ₹</label><input name="opening_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a?.opening_balance ?? '')}" required></div>` : ''}
         ${a && admin ? `<div class="field"><label>Current balance ₹ (correction)</label><input name="current_balance" type="number" step="0.01" inputmode="decimal" value="${esc(a.current_balance)}"></div>` : ''}
+        ${admin ? `<div class="field"><label>Deposit for this ID ₹ (money you gave)</label><input name="deposit" type="number" step="0.01" min="0" inputmode="decimal" value="${esc(a?.deposit ?? 0)}"></div>` : ''}
         <div class="field"><label>Commission % on daily loss</label><input name="commission_pct" type="number" step="0.01" min="0" max="100" inputmode="decimal" value="${esc(a?.commission_pct ?? 10)}" required></div>
         ${a ? `<div class="field"><label>Status</label><select name="status"><option value="active">Active</option><option value="closed" ${a.status === 'closed' ? 'selected' : ''}>Closed</option></select></div>` : ''}
       </div>
@@ -522,6 +527,7 @@ function idForm(a = null) {
       if (f.status) row.status = f.status;
       if (admin) row.vendor_id = f.vendor_id;
       if ('opening_balance' in f) row.opening_balance = Number(f.opening_balance || 0);
+      if ('deposit' in f) row.deposit = Number(f.deposit || 0);
       if (a && admin && f.current_balance !== '' && Number(f.current_balance) !== Number(a.current_balance)) row.current_balance = Number(f.current_balance);
       busy(e.submitter, async () => {
         if (a) must(await sb.from('accounts').update(row).eq('id', a.id));
