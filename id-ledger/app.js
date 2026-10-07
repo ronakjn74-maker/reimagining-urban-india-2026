@@ -615,27 +615,82 @@ function idForm(a = null) {
   });
 }
 
-function statement(a) {
-  const rows = [];
+// Full statement of one ID: every entry oldest → newest with a running balance, a check against the
+// current balance, and (owner only) the permanent change history from the database audit log.
+function statementRows(a) {
+  const admin = isAdmin();
+  const rows = [{ t: a.created_at, type: 'Start', label: `ID added – start balance${admin && Number(a.deposit) ? ` (you paid ${money(a.deposit)})` : ''}`, amt: Number(a.opening_balance), start: true }];
   S.data.requests.filter((r) => r.from_account === a.id || r.to_account === a.id).forEach((r) => {
-    const out = r.from_account === a.id;
-    const other = r.kind === 'transfer' ? ` ${out ? '→' : '←'} ${accName(acc(out ? r.to_account : r.from_account))}` : '';
-    rows.push({ t: r.responded_at || r.created_at, label: `#${r.id} ${KIND[r.kind]}${other}${r.method ? ` · ${METHOD[r.method]}` : ''}`,
-      amt: r.status === 'completed' ? (out ? -r.amount : +depCredit(r)) : null, raw: out ? r.amount : depCredit(r), status: r.status,
-      after: r.status === 'completed' ? (out ? r.from_balance_after : r.to_balance_after) : null });
+    const out = r.from_account === a.id; const done = r.status === 'completed';
+    const other = r.kind === 'transfer' ? ` ${out ? 'to' : 'from'} ${accName(acc(out ? r.to_account : r.from_account))}` : '';
+    const extra = [r.method && METHOD[r.method], r.kind === 'deposit' && !out && depCredit(r) !== Number(r.amount) ? `paid ${money(r.amount)}` : '',
+      r.commission_amount ? `commission ${money(r.commission_amount)}` : '', r.token_no && `token ${r.token_no}`, r.note, r.response_note && `vendor: ${r.response_note}`].filter(Boolean).join(' · ');
+    rows.push({ t: done ? r.responded_at : r.created_at, type: `${r.is_reset ? 'Reset · ' : ''}${KIND[r.kind]}`, label: `#${r.id}${other}${extra ? ' · ' + extra : ''}`,
+      amt: done ? (out ? -Number(r.amount) : depCredit(r)) : null, info: done ? null : `${r.status} · ${money(out ? r.amount : depCredit(r))}`, ref: r.id });
   });
-  if (isAdmin()) S.data.pnl.filter((p) => p.account_id === a.id).forEach((p) =>
-    rows.push({ t: p.created_at, label: `P&L for ${fmtD(p.settle_date)}${p.note ? ` · ${p.note}` : ''}`, amt: Number(p.amount), status: 'pnl' }));
-  rows.sort((x, y) => new Date(y.t) - new Date(x.t));
+  if (admin) {
+    S.data.pnl.filter((p) => p.account_id === a.id).forEach((p) =>
+      rows.push({ t: p.created_at, type: p.bet_id ? 'Bet result' : 'P&L', label: `${fmtD(p.settle_date)}${p.note ? ' · ' + p.note : ''}`, amt: Number(p.amount) }));
+    S.data.bets.filter((b) => b.account_id === a.id && b.result === 'open').forEach((b) =>
+      rows.push({ t: b.created_at, type: 'Bet placed', label: `#${b.id} ${betLabel(b)} · ${b.side.toUpperCase()} ${money(b.stake)} @ ${Number(b.odds)}`, amt: null, info: 'open' }));
+    S.data.settlements.filter((x) => x.account_id === a.id).forEach((x) =>
+      rows.push({ t: x.received_at || x.created_at, type: 'Commission', label: `${fmtD(x.settle_date)} · loss ${money(-x.net_pnl)} × ${Number(x.commission_pct)}% · ${x.status}${x.payout ? ' (' + x.payout + ')' : ''}`, amt: null, info: money(x.commission) }));
+  }
+  rows.sort((x, y) => (x.start ? -1 : y.start ? 1 : new Date(x.t) - new Date(y.t)));
+  let bal = 0; rows.forEach((r) => { if (r.amt != null) { bal += r.amt; r.bal = Math.round(bal * 100) / 100; } });
+  const diff = Math.round((Number(a.current_balance) - bal) * 100) / 100;
+  if (diff) rows.push({ t: a.updated_at, type: admin ? 'Correction' : 'Game result', label: admin ? 'Balance changed by hand (see change history)' : 'Net result of play', amt: diff, bal: Number(a.current_balance) });
+  return rows;
+}
+function auditSummary(e) {
+  const skip = new Set(['updated_at', 'created_at', 'id', 'created_by', 'vendor_id', 'investor_id', 'account_id', 'from_account', 'to_account',
+    'responded_by', 'responded_at', 'from_balance_after', 'to_balance_after', 'last_reset_at', 'settled_at']);
+  if (e.action === 'insert') return 'added' + (e.table_name === 'bets' ? `: ${e.new_row.selection || ''} ${String(e.new_row.side || '').toUpperCase()} ${money(e.new_row.stake)} @ ${e.new_row.odds}` : e.new_row?.amount != null ? `: ${money(e.new_row.amount)}` : '');
+  if (e.action === 'delete') return 'DELETED' + (e.old_row?.amount != null ? `: ${money(e.old_row.amount)}` : e.old_row?.stake != null ? `: stake ${money(e.old_row.stake)}` : '');
+  const ch = Object.keys(e.new_row || {}).filter((k) => !skip.has(k) && JSON.stringify(e.old_row?.[k]) !== JSON.stringify(e.new_row[k]));
+  return ch.map((k) => `${k.replace(/_/g, ' ')}: ${e.old_row?.[k] ?? '—'} → ${e.new_row[k] ?? '—'}`).join(' · ') || 'updated';
+}
+const TABLE_NAME = { accounts: 'ID', requests: 'Request', pnl_entries: 'P&L', bets: 'Bet', settlements: 'Commission' };
+function statement(a) {
+  const admin = isAdmin();
+  const rows = statementRows(a);
+  const last = [...rows].reverse().find((r) => r.bal != null);
+  const ok = last && Math.abs(last.bal - Number(a.current_balance)) < 0.01;
   openModal(`Statement · ${accName(a)}`, `
     <div class="row between" style="margin-bottom:12px">
       <div><div class="muted small">Current balance</div><div class="big">${money(a.current_balance)}</div></div>
-      <div class="muted small" style="text-align:right">Start ${money(a.opening_balance)}<br>Added ${fmtDT(a.created_at)}</div>
+      <div class="muted small" style="text-align:right">${esc(vendorName(a.vendor_id))}<br>Added ${fmtDT(a.created_at)}</div>
     </div>
-    ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>When</th><th>Entry</th><th class="r">Amount</th><th class="r">Balance after</th></tr></thead><tbody>
-      ${rows.map((r) => `<tr><td>${fmtDT(r.t)}</td><td>${esc(r.label)} ${r.status !== 'completed' && r.status !== 'pnl' ? `<span class="pill ${r.status}">${r.status}</span>` : ''}</td>
-        <td class="r">${r.amt == null ? `<span class="muted num">${money(r.raw)}</span>` : signed(r.amt)}</td><td class="r num">${r.after != null ? money(r.after) : ''}</td></tr>`).join('')}
-    </tbody></table></div>` : '<div class="empty">No entries yet</div>'}`);
+    <div class="row" style="margin-bottom:10px"><button class="btn sm" id="st-csv">⬇ Download (Excel)</button><button class="btn sm" id="st-print">🖨 Print / PDF</button></div>
+    <div id="st-body"><div class="table-wrap"><table><thead><tr><th>When</th><th>Type</th><th>Details</th><th class="r">Amount</th><th class="r">Balance</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr><td>${fmtDT(r.t)}</td><td>${esc(r.type)}</td><td style="white-space:normal">${esc(r.label)}</td>
+        <td class="r">${r.amt != null ? signed(r.amt) : `<span class="muted small">${esc(r.info || '')}</span>`}</td><td class="r num">${r.bal != null ? money(r.bal) : ''}</td></tr>`).join('')}
+    </tbody></table></div>
+    <p class="small ${ok ? 'pos' : 'neg'}" style="margin-top:8px">${ok ? '✓ Running balance matches the current balance.' : '⚠ Running balance does not match – see the change history.'}</p></div>
+    ${admin ? `<div class="section" style="margin-top:14px"><div class="section-head"><h3>Change history (cannot be edited)</h3></div><div id="st-audit" class="muted small">Loading…</div></div>` : ''}`, async (root) => {
+    const audit = admin ? ((await sb.from('audit_log').select('*').contains('account_ids', [a.id]).order('at')).data || []) : [];
+    if (admin) $('#st-audit', root).innerHTML = audit.length ? `<div class="table-wrap"><table><thead><tr><th>When</th><th>Who</th><th>What</th><th>Change</th></tr></thead><tbody>
+      ${audit.map((e) => `<tr><td>${fmtDT(e.at)}</td><td>${esc(e.actor_name || (e.via === 'existing' ? 'before history' : 'system'))}</td><td>${e.table_name === 'accounts' ? 'ID' : `${esc(TABLE_NAME[e.table_name] || e.table_name)} #${esc(e.row_id)}`}</td>
+        <td style="white-space:normal" class="${e.action === 'delete' ? 'neg' : ''}">${esc(auditSummary(e))}</td></tr>`).join('')}</tbody></table></div>` : 'No changes recorded yet.';
+    $('#st-csv', root).onclick = () => {
+      const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const lines = [['When', 'Type', 'Details', 'Amount', 'Balance'].map(q).join(','),
+        ...rows.map((r) => [fmtDT(r.t), r.type, r.label, r.amt ?? r.info ?? '', r.bal ?? ''].map(q).join(','))];
+      if (audit.length) lines.push('', q('Change history'), ['When', 'Who', 'What', 'Change'].map(q).join(','),
+        ...audit.map((e) => [fmtDT(e.at), e.actor_name || e.via, e.table_name === 'accounts' ? 'ID' : `${TABLE_NAME[e.table_name] || e.table_name} #${e.row_id}`, auditSummary(e)].map(q).join(',')));
+      const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv' });
+      const link = document.createElement('a'); link.href = URL.createObjectURL(blob);
+      link.download = `statement-${(a.site_name || 'id')}-${a.username}-${todayIST()}.csv`.replace(/[^\w.-]+/g, '_'); link.click();
+    };
+    $('#st-print', root).onclick = () => {
+      const w = window.open('', '_blank'); if (!w) return toast('Allow pop-ups to print', 'error');
+      w.document.write(`<!doctype html><meta charset="utf-8"><title>Statement ${esc(accName(a))}</title>
+        <style>body{font:13px system-ui,sans-serif;margin:24px;color:#111}table{border-collapse:collapse;width:100%;margin-top:10px}td,th{border:1px solid #ccc;padding:5px 7px;text-align:left;vertical-align:top}.r{text-align:right}.pos{color:#15803d}.neg{color:#b91c1c}.muted{color:#666}h1{font-size:18px;margin:0}</style>
+        <h1>Statement · ${esc(accName(a))}</h1><div class="muted">${esc(vendorName(a.vendor_id))} · printed ${fmtDT(new Date().toISOString())} · current balance ${money(a.current_balance)}</div>
+        ${$('#st-body', root).innerHTML}${admin ? `<h3>Change history</h3>${$('#st-audit', root).innerHTML}` : ''}`);
+      w.document.close(); w.focus(); setTimeout(() => w.print(), 300);
+    };
+  });
 }
 
 // ============================================================

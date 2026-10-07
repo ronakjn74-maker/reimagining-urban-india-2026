@@ -891,3 +891,63 @@ create policy proofs_upload on storage.objects for insert to authenticated
          or ((storage.foldername(name))[1] = auth.uid()::text and public.is_active_user())));
 create policy proofs_delete on storage.objects for delete to authenticated
   using (bucket_id = 'proofs' and public.is_admin());
+
+-- ---------------------------------------------------------------------
+-- Permanent change history (for disputes). Every add / edit / delete on these tables is copied here
+-- with who did it and when. Only the owner can read it; nobody can edit or delete it from the app.
+-- ---------------------------------------------------------------------
+create table public.audit_log (
+  id           bigint generated always as identity primary key,
+  at           timestamptz not null default now(),
+  actor        uuid,
+  actor_name   text,
+  via          text,
+  table_name   text not null,
+  action       text not null,
+  row_id       text,
+  account_ids  uuid[],
+  old_row      jsonb,
+  new_row      jsonb
+);
+create index audit_log_accounts on public.audit_log using gin (account_ids);
+create index audit_log_at on public.audit_log (at);
+alter table public.audit_log enable row level security;
+create policy audit_read on public.audit_log for select using (is_admin());
+revoke all on public.audit_log from anon;
+revoke insert, update, delete, truncate on public.audit_log from authenticated;
+
+create or replace function public.audit_trigger() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare o jsonb := case when tg_op <> 'INSERT' then to_jsonb(old) end;
+        n jsonb := case when tg_op <> 'DELETE' then to_jsonb(new) end;
+        r jsonb; ids uuid[];
+begin
+  if tg_op = 'UPDATE' and (o - 'updated_at') = (n - 'updated_at') then return new; end if;
+  o := o - 'password'; n := n - 'password';   -- never copy ID passwords into the log
+  r := coalesce(n, o);
+  ids := case tg_table_name
+    when 'accounts' then array[(r->>'id')::uuid]
+    when 'requests' then array_remove(array[(r->>'from_account')::uuid, (r->>'to_account')::uuid], null)
+    when 'pnl_entries' then array[(r->>'account_id')::uuid]
+    when 'bets' then array[(r->>'account_id')::uuid]
+    when 'settlements' then array[(r->>'account_id')::uuid]
+    else array[]::uuid[] end;
+  insert into audit_log (actor, actor_name, via, table_name, action, row_id, account_ids, old_row, new_row)
+  values (auth.uid(), (select name from profiles where id = auth.uid()),
+          case when current_user in ('authenticated','anon') then 'app' else 'system' end,
+          tg_table_name, lower(tg_op), r->>'id', ids,
+          case when tg_op = 'INSERT' then null else o end,
+          case when tg_op = 'DELETE' then null else n end);
+  return coalesce(new, old);
+end $$;
+
+create trigger zz_audit after insert or update or delete on public.accounts for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.requests for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.pnl_entries for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.bets for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.settlements for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.ledger for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.investor_stocks for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.investor_returns for each row execute function public.audit_trigger();
+create trigger zz_audit after insert or update or delete on public.investor_money for each row execute function public.audit_trigger();
+alter publication supabase_realtime add table public.audit_log;
