@@ -521,6 +521,21 @@ begin new.symbol := upper(trim(new.symbol)); return new; end $$;
 create trigger investor_stocks_norm before insert or update on public.investor_stocks
   for each row execute function public.investor_stocks_norm();
 
+-- Money between you and the investor: what he sent you (cash he got from selling the shares).
+-- Money you pay back is an investor_returns row with mode 'cash'.
+create table public.investor_money (
+  id           bigint generated always as identity primary key,
+  investor_id  uuid not null references public.profiles(id) on delete cascade,
+  amount       numeric(14,2) not null check (amount > 0),
+  paid_on      date not null default ((now() at time zone 'Asia/Kolkata')::date),
+  mode         text,
+  reference    text,
+  note         text,
+  created_by   uuid default auth.uid(),
+  created_at   timestamptz not null default now()
+);
+create index on public.investor_money (investor_id);
+
 -- Daily closing prices (filled automatically; owner can type a price, which is never overwritten).
 create table public.stock_prices (
   symbol      text not null,
@@ -692,6 +707,7 @@ alter table public.investor_stocks  enable row level security;
 alter table public.investor_returns enable row level security;
 alter table public.stock_prices     enable row level security;
 alter table public.price_fetch_jobs enable row level security;
+alter table public.investor_money   enable row level security;
 
 create policy profiles_read   on public.profiles for select using (is_admin() or id = auth.uid());
 create policy profiles_update on public.profiles for update using (is_admin()) with check (is_admin());
@@ -731,6 +747,16 @@ create policy inv_stocks_self_remove on public.investor_stocks for delete
 create policy inv_returns_read  on public.investor_returns for select
   using (is_admin() or (investor_id = auth.uid() and is_active_user()));
 create policy inv_returns_admin on public.investor_returns for all using (is_admin()) with check (is_admin());
+create policy inv_money_read on public.investor_money for select
+  using (is_admin() or (investor_id = auth.uid() and is_active_user()));
+create policy inv_money_admin on public.investor_money for all using (is_admin()) with check (is_admin());
+create policy inv_money_self_insert on public.investor_money for insert
+  with check (is_investor() and investor_id = auth.uid() and created_by = auth.uid());
+create policy inv_money_self_update on public.investor_money for update
+  using (is_investor() and investor_id = auth.uid() and created_by = auth.uid())
+  with check (is_investor() and investor_id = auth.uid() and created_by = auth.uid());
+create policy inv_money_self_remove on public.investor_money for delete
+  using (is_investor() and investor_id = auth.uid() and created_by = auth.uid());
 create policy prices_read  on public.stock_prices for select
   using (is_admin() or exists (select 1 from public.profiles where id = auth.uid() and role = 'investor' and active));
 create policy prices_admin on public.stock_prices for all using (is_admin()) with check (is_admin());
@@ -753,14 +779,14 @@ revoke execute on function public._create_login(text, text, text, text, text), p
 -- Supabase grants table access to the "anon" role by default; RLS already blocks it, this makes it explicit.
 revoke all on public.profiles, public.accounts, public.requests, public.pnl_entries,
               public.settlements, public.ledger, public.bets,
-              public.investor_stocks, public.investor_returns, public.stock_prices, public.price_fetch_jobs from anon;
+              public.investor_stocks, public.investor_returns, public.stock_prices, public.price_fetch_jobs, public.investor_money from anon;
 
 -- ---------------------------------------------------------------------
 -- Live updates in the browser
 -- ---------------------------------------------------------------------
 alter publication supabase_realtime add table
   public.profiles, public.accounts, public.requests, public.pnl_entries, public.settlements, public.ledger, public.bets,
-  public.investor_stocks, public.investor_returns, public.stock_prices;
+  public.investor_stocks, public.investor_returns, public.stock_prices, public.investor_money;
 
 -- ---------------------------------------------------------------------
 -- Photos (cash tokens, slips, proofs). Private bucket; files are stored as

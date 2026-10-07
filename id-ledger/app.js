@@ -27,7 +27,7 @@ const S = {
   owner: null,
   view: null,
   live: false,
-  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [], bets: [], invStocks: [], invReturns: [], prices: [] },
+  data: { profiles: [], accounts: [], requests: [], pnl: [], settlements: [], ledger: [], bets: [], invStocks: [], invReturns: [], prices: [], invMoney: [] },
   f: { idSearch: '', idVendor: '', idStatus: 'active', reqTab: 'pending', reqVendor: '', pnlDate: null, comDate: null, ledVendor: '' },
 };
 const isAdmin = () => S.me?.role === 'admin';
@@ -135,7 +135,7 @@ async function fetchAll(table, order) {
 }
 async function loadData() {
   const admin = isAdmin(); const inv = admin || isInvestor(); const ven = !isInvestor();
-  const [profiles, accounts, requests, settlements, pnl, ledger, bets, invStocks, invReturns, prices] = await Promise.all([
+  const [profiles, accounts, requests, settlements, pnl, ledger, bets, invStocks, invReturns, prices, invMoney] = await Promise.all([
     fetchAll('profiles', 'created_at'),
     ven ? fetchAll('accounts', 'created_at') : [],
     ven ? fetchAll('requests', 'created_at') : [],
@@ -146,9 +146,10 @@ async function loadData() {
     inv ? fetchAll('investor_stocks', 'created_at') : [],
     inv ? fetchAll('investor_returns', 'created_at') : [],
     inv ? fetchAll('stock_prices', 'price_date') : [],
+    inv ? fetchAll('investor_money', 'paid_on') : [],
   ]);
   // a settlement line recalculated to 0 (loss later corrected) is kept in the database but hidden here
-  S.data = { profiles, accounts, requests, settlements: settlements.filter((x) => Number(x.commission) > 0), pnl, ledger, bets, invStocks, invReturns, prices };
+  S.data = { profiles, accounts, requests, settlements: settlements.filter((x) => Number(x.commission) > 0), pnl, ledger, bets, invStocks, invReturns, prices, invMoney };
   const me = profiles.find((p) => p.id === S.me.id);
   if (me) S.me = me;
 }
@@ -1135,6 +1136,16 @@ function viewInvestors(v) {
   const lastDate = daily[0]?.date;
   const change = daily.length > 1 ? daily[0].due - daily[1].due : null;
   const rets = S.data.invReturns.filter((x) => x.investor_id === inv.id);
+  const moneyIn = S.data.invMoney.filter((x) => x.investor_id === inv.id);
+  const cashOut = rets.filter((x) => x.mode === 'cash');
+  const totIn = sum(moneyIn, (x) => x.amount); const totOut = sum(cashOut, (x) => x.amount);
+  const toReceive = tot.received - totIn;
+  const moneyRows = [
+    ...moneyIn.map((x) => ({ kind: 'in', date: x.paid_on, amount: Number(x.amount), x })),
+    ...cashOut.map((x) => ({ kind: 'out', date: x.paid_on, amount: Number(x.amount), x })),
+  ].sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.x.id - a.x.id);
+  const L = admin ? { in: `Received from ${inv.name}`, out: `Paid to ${inv.name}`, addIn: '+ Money received', addOut: '+ Paid to him' }
+                  : { in: 'You sent', out: 'You received back', addIn: '+ Money I sent' };
   v.innerHTML = `
     <div class="section-head">
       ${admin && investors().length > 1 ? '<button class="btn sm" id="inv-back">← All</button>' : ''}
@@ -1153,6 +1164,22 @@ function viewInvestors(v) {
       ${admin ? '<button class="btn" id="inv-return">Return / pay</button>' : ''}
       <button class="btn" id="inv-refresh">↻ Update prices</button>
       ${admin ? '<button class="btn" id="inv-price">Type a price</button>' : ''}
+    </div>
+    <div class="section">
+      <div class="section-head"><h2>Money</h2>
+        <button class="btn sm primary" id="inv-money-in">${L.addIn}</button>
+        ${admin ? `<button class="btn sm" id="inv-money-out">${L.addOut}</button>` : ''}</div>
+      <div class="kpis section">
+        ${kpi(L.in, signed(totIn), `${moneyIn.length} payment${moneyIn.length === 1 ? '' : 's'}`)}
+        ${kpi(L.out, signed(-totOut), `${cashOut.length} payment${cashOut.length === 1 ? '' : 's'}`)}
+        ${kpi('Net', signed(totIn - totOut), admin ? 'Received − paid' : 'Sent − received back')}
+        ${kpi(admin ? 'Still to receive from him' : 'Still to send', money(Math.max(0, toReceive)), `Shares sold value ${money(tot.received)}`)}
+      </div>
+      ${moneyRows.length ? `<div class="list">${moneyRows.map((m) => `<div class="item row between">
+        <div><b class="${m.kind === 'in' ? 'pos' : 'neg'}">${m.kind === 'in' ? L.in : L.out}</b>
+          <div class="muted small">${fmtD(m.date)}${m.x.mode && m.kind === 'in' ? ` · ${esc(m.x.mode)}` : ''}${m.x.payment_mode && m.kind === 'out' ? ` · ${esc(m.x.payment_mode)}` : ''}${m.kind === 'out' ? ` · counts as ${qtyFmt(m.x.qty)} ${esc(m.x.symbol)} @ ${money(m.x.rate)}` : ''}${m.x.reference ? ` · ${esc(m.x.reference)}` : ''}${m.x.note ? ` · ${esc(m.x.note)}` : ''}${admin && m.kind === 'in' && m.x.created_by === inv.id ? ` · <span class="pill pending">added by ${esc(inv.name)}</span>` : ''}</div></div>
+        <div class="row">${signed(m.kind === 'in' ? m.amount : -m.amount)}
+          ${m.kind === 'in' && (admin || m.x.created_by === S.me.id) ? `<button class="icon-btn" data-del-money="${m.x.id}" title="Delete">🗑</button>` : ''}</div></div>`).join('')}</div>` : '<div class="empty">No money entries yet</div>'}
     </div>
     <div class="section">
       <div class="section-head"><h2>Stocks</h2></div>
@@ -1187,6 +1214,9 @@ function viewInvestors(v) {
           ${admin && byInv ? ` <span class="pill pending">added by ${esc(inv.name)}</span>` : ''}${!admin && !mine ? ' <span class="pill">added by owner</span>' : ''}</div>
         ${admin || mine ? `<div class="row"><button class="icon-btn" data-edit-stock="${x.id}" title="Edit">✎</button><button class="icon-btn" data-del-stock="${x.id}" title="Delete">🗑</button></div>` : ''}</div>`; }).join('') || '<div class="empty">None yet</div>'}</div></div>`;
   $('#inv-add-stock').onclick = () => stockForm(inv);
+  $('#inv-money-in').onclick = () => moneyForm(inv);
+  v.querySelectorAll('[data-del-money]').forEach((b) => b.onclick = () => confirm('Delete this money entry?') &&
+    busy(b, async () => { must(await sb.from('investor_money').delete().eq('id', b.dataset.delMoney)); toast('Deleted'); scheduleReload(); }));
   $('#inv-refresh').onclick = (e) => busy(e.target, async () => {
     const n = must(await sb.rpc('queue_price_fetch'));
     if (!n) return toast('No stocks to price');
@@ -1201,6 +1231,7 @@ function viewInvestors(v) {
   $('#inv-back')?.addEventListener('click', () => { S.f.investor = null; renderView(); });
   $('#inv-wa').onclick = () => openWA(inv.phone, investorMessage(inv));
   $('#inv-return').onclick = () => returnForm(inv, rows);
+  $('#inv-money-out').onclick = () => returnForm(inv, rows, 'cash');
   $('#inv-price').onclick = () => priceForm(rows);
   v.querySelectorAll('[data-del-ret]').forEach((b) => b.onclick = () => confirm('Delete this return / payment?') &&
     busy(b, async () => { must(await sb.from('investor_returns').delete().eq('id', b.dataset.delRet)); toast('Deleted'); scheduleReload(); }));
@@ -1265,12 +1296,35 @@ function stockForm(inv, x = null) {
     };
   });
 }
-function returnForm(inv, rows) {
+function moneyForm(inv) {
+  const admin = isAdmin();
+  openModal(admin ? `Money received from ${inv.name}` : 'Money I sent', `
+    <form id="money-form">
+      <div class="fields two">
+        <div class="field"><label>Amount ₹</label><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></div>
+        <div class="field"><label>Date</label><input name="paid_on" type="date" value="${todayIST()}" required></div>
+        <div class="field"><label>Mode</label><select name="mode">${['UPI', 'Bank transfer', 'Cash', 'Other'].map((m) => `<option>${m}</option>`).join('')}</select></div>
+        <div class="field"><label>Reference / UTR</label><input name="reference"></div>
+      </div>
+      <div class="field"><label>Note</label><input name="note" placeholder="e.g. money from selling TCS"></div>
+      <button class="btn primary block">Save</button>
+    </form>`, (root) => {
+    $('#money-form', root).onsubmit = (e) => {
+      e.preventDefault(); const f = formObj(e.target);
+      busy(e.submitter, async () => {
+        must(await sb.from('investor_money').insert({ investor_id: inv.id, amount: Number(f.amount), paid_on: f.paid_on, mode: f.mode,
+          reference: f.reference.trim() || null, note: f.note.trim() || null }));
+        modal.close(); toast('Saved'); scheduleReload();
+      });
+    };
+  });
+}
+function returnForm(inv, rows, startMode = 'shares') {
   const open = rows.filter((r) => r.owed > 0);
   if (!open.length) return toast('Nothing owed', 'error');
   openModal(`Return to ${inv.name}`, `
     <form id="ret-form">
-      <div class="field"><div class="seg"><label><input type="radio" name="mode" value="shares" checked><span>Give shares</span></label><label><input type="radio" name="mode" value="cash"><span>Pay cash</span></label></div></div>
+      <div class="field"><div class="seg"><label><input type="radio" name="mode" value="shares" ${startMode === 'shares' ? 'checked' : ''}><span>Give shares</span></label><label><input type="radio" name="mode" value="cash" ${startMode === 'cash' ? 'checked' : ''}><span>Pay cash</span></label></div></div>
       <div class="field"><label>Stock</label><select name="stock">${open.map((r) => `<option value="${esc(stockKey(r))}">${esc(r.symbol)} (${r.exchange}) – ${qtyFmt(r.owed)} owed</option>`).join('')}</select></div>
       <div class="fields two">
         <div class="field" data-m="shares"><label>Shares returned</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal"></div>
