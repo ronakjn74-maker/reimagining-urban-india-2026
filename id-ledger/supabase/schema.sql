@@ -441,9 +441,38 @@ create table public.investor_stocks (
   sell_rate    numeric(14,2) not null check (sell_rate > 0),
   sold_on      date not null default ((now() at time zone 'Asia/Kolkata')::date),
   note         text,
+  created_by   uuid default auth.uid(),
   created_at   timestamptz not null default now()
 );
 create index on public.investor_stocks (investor_id);
+
+create or replace function public.is_investor() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from profiles where id = auth.uid() and role = 'investor' and active)
+$$;
+
+-- An investor can add his own shares, and change/remove only his own entries before anything was returned on that stock.
+create or replace function public.investor_stocks_lock() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare r public.investor_stocks;
+begin
+  if is_admin() then return coalesce(new, old); end if;
+  if tg_op = 'INSERT' then
+    new.created_by := auth.uid();
+    return new;
+  end if;
+  r := old;
+  if exists (select 1 from investor_returns x where x.investor_id = r.investor_id and x.symbol = r.symbol and x.exchange = r.exchange) then
+    raise exception 'Shares of % were already returned – ask the owner to change this entry', r.symbol;
+  end if;
+  if tg_op = 'UPDATE' then
+    new.created_by := old.created_by; new.investor_id := old.investor_id;
+    return new;
+  end if;
+  return old;
+end $$;
+create trigger investor_stocks_lock before insert or update or delete on public.investor_stocks
+  for each row execute function public.investor_stocks_lock();
 
 create table public.investor_returns (
   id            bigint generated always as identity primary key,
@@ -516,7 +545,7 @@ create or replace function public.queue_price_fetch() returns integer
 language plpgsql security definer set search_path = public as $$
 declare r record; n integer := 0; rid bigint;
 begin
-  if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
+  if auth.uid() is not null and not (is_admin() or is_investor()) then raise exception 'Not allowed'; end if;
   if not exists (select 1 from pg_extension where extname = 'pg_net') then
     raise exception 'Automatic prices are off – run automation.sql in Supabase once';
   end if;
@@ -540,7 +569,7 @@ create or replace function public.collect_prices() returns integer
 language plpgsql security definer set search_path = public as $$
 declare j record; body jsonb; px numeric; ts bigint; n integer := 0;
 begin
-  if auth.uid() is not null and not is_admin() then raise exception 'Not allowed'; end if;
+  if auth.uid() is not null and not (is_admin() or is_investor()) then raise exception 'Not allowed'; end if;
   for j in execute
     'select f.request_id, f.symbol, f.exchange, r.status_code, r.content
        from price_fetch_jobs f join net._http_response r on r.id = f.request_id
@@ -692,6 +721,13 @@ create policy bets_admin   on public.bets   for all using (is_admin()) with chec
 create policy inv_stocks_read  on public.investor_stocks for select
   using (is_admin() or (investor_id = auth.uid() and is_active_user()));
 create policy inv_stocks_admin on public.investor_stocks for all using (is_admin()) with check (is_admin());
+create policy inv_stocks_self_insert on public.investor_stocks for insert
+  with check (is_investor() and investor_id = auth.uid() and created_by = auth.uid());
+create policy inv_stocks_self_update on public.investor_stocks for update
+  using (is_investor() and investor_id = auth.uid() and created_by = auth.uid())
+  with check (is_investor() and investor_id = auth.uid() and created_by = auth.uid());
+create policy inv_stocks_self_remove on public.investor_stocks for delete
+  using (is_investor() and investor_id = auth.uid() and created_by = auth.uid());
 create policy inv_returns_read  on public.investor_returns for select
   using (is_admin() or (investor_id = auth.uid() and is_active_user()));
 create policy inv_returns_admin on public.investor_returns for all using (is_admin()) with check (is_admin());
@@ -704,7 +740,7 @@ create policy prices_admin on public.stock_prices for all using (is_admin()) wit
 revoke execute on all functions in schema public from public, anon;
 grant  execute on function public.settle_day(timestamptz), public.is_admin(), public.is_active_user(),
        public.create_request(text, uuid, uuid, numeric, text, jsonb), public.respond_request(bigint, boolean, text, text),
-       public.owner_contact(),
+       public.owner_contact(), public.is_investor(),
        public.cancel_request(bigint), public.run_settlement(date),
        public.request_commission(bigint, text, text, jsonb),
        public.admin_create_investor(text, text, text, text), public.queue_price_fetch(), public.collect_prices(),

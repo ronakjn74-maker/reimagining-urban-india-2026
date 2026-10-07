@@ -1147,13 +1147,13 @@ function viewInvestors(v) {
       ${kpi('Returned so far', money(tot.returned), 'Shares + cash')}
       ${kpi('Market move on shares still owed', signed(tot.due - tot.owedAtSellRate), 'Today’s value − value at sell rate')}
     </div>
-    ${tot.missing ? `<p class="neg small">${tot.missing} stock(s) have no price yet${admin ? ' – press Update prices, or type the price.' : '.'}</p>` : ''}
-    ${admin ? `<div class="row section">
-      <button class="btn primary" id="inv-add-stock">+ Stock sold</button>
-      <button class="btn" id="inv-return">Return / pay</button>
+    ${tot.missing ? `<p class="neg small">${tot.missing} stock(s) have no price yet – press Update prices${admin ? ', or type the price' : ''}.</p>` : ''}
+    <div class="row section">
+      <button class="btn primary" id="inv-add-stock">${admin ? '+ Stock sold' : '+ Add share'}</button>
+      ${admin ? '<button class="btn" id="inv-return">Return / pay</button>' : ''}
       <button class="btn" id="inv-refresh">↻ Update prices</button>
-      <button class="btn" id="inv-price">Type a price</button>
-    </div>` : ''}
+      ${admin ? '<button class="btn" id="inv-price">Type a price</button>' : ''}
+    </div>
     <div class="section">
       <div class="section-head"><h2>Stocks</h2></div>
       ${rows.length ? `<div class="list">${rows.map((r) => `<div class="item">
@@ -1179,28 +1179,31 @@ function viewInvestors(v) {
           <div class="muted small">${fmtD(x.paid_on)} · ${x.mode === 'cash' ? `= ${qtyFmt(x.qty)} ${esc(x.symbol)} @ ${money(x.rate)}` : `worth ${money(x.amount)} @ ${money(x.rate)}`}${x.payment_mode ? ` · ${esc(x.payment_mode)}` : ''}${x.reference ? ` · ${esc(x.reference)}` : ''}${x.note ? ` · ${esc(x.note)}` : ''}</div></div>
         ${admin ? `<button class="icon-btn" data-del-ret="${x.id}" title="Delete">🗑</button>` : ''}</div>`).join('')}</div>` : '<div class="empty">Nothing returned yet</div>'}
     </div>
-    ${admin ? `<div class="section"><div class="section-head"><h2>Stocks he sold (entries)</h2></div>
-      <div class="list">${S.data.invStocks.filter((x) => x.investor_id === inv.id).map((x) => `<div class="item row between">
-        <div><b>${esc(x.symbol)}</b> <span class="muted small">${x.exchange} · ${qtyFmt(x.qty)} @ ${money(x.sell_rate)} · ${fmtD(x.sold_on)}${x.note ? ` · ${esc(x.note)}` : ''}</span></div>
-        <div class="row"><button class="icon-btn" data-edit-stock="${x.id}" title="Edit">✎</button><button class="icon-btn" data-del-stock="${x.id}" title="Delete">🗑</button></div></div>`).join('') || '<div class="empty">None</div>'}</div></div>` : ''}`;
-  if (!admin) return;
-  $('#inv-back')?.addEventListener('click', () => { S.f.investor = null; renderView(); });
-  $('#inv-wa').onclick = () => openWA(inv.phone, investorMessage(inv));
+    <div class="section"><div class="section-head"><h2>${admin ? 'Stocks he sold (entries)' : 'My share entries'}</h2></div>
+      <div class="list">${S.data.invStocks.filter((x) => x.investor_id === inv.id).map((x) => {
+        const mine = x.created_by === S.me.id; const byInv = x.created_by === inv.id;
+        return `<div class="item row between">
+        <div><b>${esc(x.symbol)}</b> <span class="muted small">${x.exchange}${x.stock_name ? ` · ${esc(x.stock_name)}` : ''} · ${qtyFmt(x.qty)} @ ${money(x.sell_rate)} · ${fmtD(x.sold_on)}${x.note ? ` · ${esc(x.note)}` : ''}</span>
+          ${admin && byInv ? ` <span class="pill pending">added by ${esc(inv.name)}</span>` : ''}${!admin && !mine ? ' <span class="pill">added by owner</span>' : ''}</div>
+        ${admin || mine ? `<div class="row"><button class="icon-btn" data-edit-stock="${x.id}" title="Edit">✎</button><button class="icon-btn" data-del-stock="${x.id}" title="Delete">🗑</button></div>` : ''}</div>`; }).join('') || '<div class="empty">None yet</div>'}</div></div>`;
   $('#inv-add-stock').onclick = () => stockForm(inv);
-  $('#inv-return').onclick = () => returnForm(inv, rows);
-  $('#inv-price').onclick = () => priceForm(rows);
   $('#inv-refresh').onclick = (e) => busy(e.target, async () => {
     const n = must(await sb.rpc('queue_price_fetch'));
     if (!n) return toast('No stocks to price');
     await new Promise((r) => setTimeout(r, 5000));
     const got = must(await sb.rpc('collect_prices'));
-    toast(`Prices updated: ${got} of ${n}${got < n ? ' – try again in a minute, or type the price' : ''}`); scheduleReload();
+    toast(`Prices updated: ${got} of ${n}${got < n ? ' – try again in a minute' : ''}`); scheduleReload();
   });
-  v.querySelectorAll('[data-del-ret]').forEach((b) => b.onclick = () => confirm('Delete this return / payment?') &&
-    busy(b, async () => { must(await sb.from('investor_returns').delete().eq('id', b.dataset.delRet)); toast('Deleted'); scheduleReload(); }));
-  v.querySelectorAll('[data-del-stock]').forEach((b) => b.onclick = () => confirm('Delete this stock entry?') &&
+  v.querySelectorAll('[data-del-stock]').forEach((b) => b.onclick = () => confirm('Delete this share entry?') &&
     busy(b, async () => { must(await sb.from('investor_stocks').delete().eq('id', b.dataset.delStock)); toast('Deleted'); scheduleReload(); }));
   v.querySelectorAll('[data-edit-stock]').forEach((b) => b.onclick = () => stockForm(inv, S.data.invStocks.find((x) => x.id === Number(b.dataset.editStock))));
+  if (!admin) return;
+  $('#inv-back')?.addEventListener('click', () => { S.f.investor = null; renderView(); });
+  $('#inv-wa').onclick = () => openWA(inv.phone, investorMessage(inv));
+  $('#inv-return').onclick = () => returnForm(inv, rows);
+  $('#inv-price').onclick = () => priceForm(rows);
+  v.querySelectorAll('[data-del-ret]').forEach((b) => b.onclick = () => confirm('Delete this return / payment?') &&
+    busy(b, async () => { must(await sb.from('investor_returns').delete().eq('id', b.dataset.delRet)); toast('Deleted'); scheduleReload(); }));
 }
 function investorMessage(inv) {
   const { rows, tot } = investorPosition(inv.id);
@@ -1233,22 +1236,23 @@ function investorForm() {
   });
 }
 function stockForm(inv, x = null) {
-  openModal(x ? 'Edit stock entry' : `Stock sold by ${inv.name}`, `
+  const me = !isAdmin();
+  openModal(x ? 'Edit share entry' : me ? 'Add a share you sold' : `Stock sold by ${inv.name}`, `
     <form id="stk-form">
       <div class="fields two">
         <div class="field"><label>Stock symbol (as on NSE/BSE)</label><input name="symbol" value="${esc(x?.symbol)}" required autocapitalize="characters" placeholder="RELIANCE"></div>
         <div class="field"><label>Exchange</label><select name="exchange"><option>NSE</option><option ${x?.exchange === 'BSE' ? 'selected' : ''}>BSE</option></select></div>
-        <div class="field"><label>Quantity sold</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal" value="${esc(x?.qty ?? '')}" required></div>
-        <div class="field"><label>Sell rate ₹</label><input name="sell_rate" type="number" step="0.01" min="0.01" inputmode="decimal" value="${esc(x?.sell_rate ?? '')}" required></div>
+        <div class="field"><label>Quantity</label><input name="qty" type="number" step="0.0001" min="0.0001" inputmode="decimal" value="${esc(x?.qty ?? '')}" required></div>
+        <div class="field"><label>Price per share ₹ (sold at)</label><input name="sell_rate" type="number" step="0.01" min="0.01" inputmode="decimal" value="${esc(x?.sell_rate ?? '')}" required></div>
         <div class="field"><label>Date sold</label><input name="sold_on" type="date" value="${esc(x?.sold_on || todayIST())}" required></div>
-        <div class="field"><label>Company name (optional)</label><input name="stock_name" value="${esc(x?.stock_name)}"></div>
+        <div class="field"><label>Share / company name</label><input name="stock_name" value="${esc(x?.stock_name)}"></div>
       </div>
       <div class="card small" id="stk-total" style="margin-bottom:12px"></div>
       <div class="field"><label>Note</label><input name="note" value="${esc(x?.note)}"></div>
       <button class="btn primary block">${x ? 'Save' : 'Add stock'}</button>
     </form>`, (root) => {
     const form = $('#stk-form', root);
-    const tot = () => { const f = formObj(form); $('#stk-total', root).innerHTML = `Money he gave for this: <b>${money(Number(f.qty || 0) * Number(f.sell_rate || 0))}</b>`; };
+    const tot = () => { const f = formObj(form); $('#stk-total', root).innerHTML = `${me ? 'Money you gave' : 'Money he gave'} for this: <b>${money(Number(f.qty || 0) * Number(f.sell_rate || 0))}</b>`; };
     form.addEventListener('input', tot); tot();
     form.onsubmit = (e) => {
       e.preventDefault(); const f = formObj(form);
