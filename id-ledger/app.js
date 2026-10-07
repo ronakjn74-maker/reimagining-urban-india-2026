@@ -397,6 +397,8 @@ function viewDashboard(v) {
 
   v.innerHTML = `
     <div class="section kpis">
+      ${(() => { const av = availableToWithdraw(); return kpi('Available to withdraw', av.total >= 0 ? `<span class="pos">${money(av.total)}</span>` : `<span class="neg">${money(av.total)}</span>`,
+        `If all IDs go back to start · commission ${money(av.comm)}${av.pending ? ` · ${av.pending} reset pending` : ''}${av.openBets ? ` · ${av.openBets} open bet${av.openBets > 1 ? 's' : ''} not counted` : ''}`); })()}
       ${kpi('Balance in IDs', money(sum(active, (a) => a.current_balance)), `${active.length} active IDs`)}
       ${kpi("Today's P&L", signed(todayPnl), `Settlement day ${fmtD(day)}`)}
       ${kpi('Total P&L', signed(totalPnl), 'All time')}
@@ -467,7 +469,8 @@ function filteredIds() {
 }
 function drawIdList() {
   const list = filteredIds();
-  $('#id-summary').textContent = `${list.length} ID${list.length === 1 ? '' : 's'} · Total balance ${money(sum(list, (a) => a.current_balance))}`;
+  const av = isAdmin() ? availableToWithdraw(S.f.idVendor || null) : null;
+  $('#id-summary').innerHTML = `${list.length} ID${list.length === 1 ? '' : 's'} · Total balance ${money(sum(list, (a) => a.current_balance))}${av ? ` · <b>Available to withdraw ${money(av.total)}</b>${av.openBets ? ` (${av.openBets} open bets not counted)` : ''}` : ''}`;
   const day = settleDay();
   $('#id-list').innerHTML = list.length ? list.map((a) => {
     const today = sum(S.data.pnl.filter((p) => p.account_id === a.id && p.settle_date === day), (p) => p.amount);
@@ -482,6 +485,10 @@ function drawIdList() {
         <div style="text-align:right"><div class="muted small">Start ${money(a.opening_balance)}</div>
           ${isAdmin() ? (() => { const c = idCredit(a); return `<div class="small">Pay ${Math.round((1 - c.pct) * 100)}%: <b>${money(c.shouldPay)}</b> · Paid <b>${money(c.paid)}</b></div>
           <div class="small">${c.short > 0 ? `<span class="neg">Short ${money(c.short)}</span>` : c.short < 0 ? `<span class="pos">Paid extra ${money(-c.short)}</span>` : '<span class="pos">Fully paid</span>'} · Upfront comm. ${money(c.upfront)}</div>`; })() : ''}
+          ${isAdmin() ? (() => { const x = resetPlan().find((y) => y.a.id === a.id); if (!x || !x.diff) return '<div class="small muted">At start</div>';
+            if (x.pending) return '<div class="small"><span class="pill pending">reset pending</span></div>';
+            return x.diff > 0 ? `<div class="small pos">To start: withdraw ${money(x.diff)}</div>`
+              : `<div class="small neg">To start: recharge ${money(-x.diff)} (pay ${money(-x.diff - x.comm)})</div>`; })() : ''}
           <div class="small">Commission <b>${Number(a.commission_pct)}%</b></div>
           ${isAdmin() && today ? `<div class="small">Today ${signed(today)}</div>` : ''}</div>
       </div>
@@ -515,6 +522,19 @@ function onIdListClick(e) {
 }
 
 // P&L since the last reset = how far the ID is from where it started.
+// Money in hand if every ID went back to its start now: profits withdrawn − recharges paid (loss − loss commission),
+// plus reset requests already sent but not yet accepted. Open bets are not counted.
+function availableToWithdraw(vendorId = null) {
+  const plan = resetPlan(vendorId).filter((x) => !x.pending && x.diff !== 0);
+  const wd = sum(plan.filter((x) => x.diff > 0), (x) => x.diff);
+  const pay = sum(plan.filter((x) => x.diff < 0), (x) => -x.diff - x.comm);
+  const comm = sum(plan, (x) => x.comm);
+  const pend = S.data.requests.filter((r) => r.is_reset && r.status === 'pending' && (!vendorId || r.vendor_id === vendorId));
+  const pendNet = sum(pend, (r) => (r.kind === 'withdrawal' ? Number(r.amount) : -Number(r.amount)));
+  const openBets = S.data.bets.filter((b) => b.result === 'open' && (!vendorId || acc(b.account_id)?.vendor_id === vendorId)).length;
+  const pendComm = sum(pend, (r) => r.commission_amount || 0);
+  return { total: wd - pay + pendNet, wd, pay, comm: comm + pendComm, pendNet, pending: pend.length, openBets };
+}
 function resetPlan(vendorId = null) {
   const pendingReset = new Set(S.data.requests.filter((r) => r.is_reset && r.status === 'pending').map((r) => r.to_account || r.from_account));
   return S.data.accounts.filter((a) => a.status === 'active' && (!vendorId || a.vendor_id === vendorId)).map((a) => {
