@@ -187,7 +187,7 @@ create or replace function public.respond_request(p_id bigint, p_accept boolean,
 returns void
 language plpgsql security definer set search_path = public as $$
 declare
-  r requests%rowtype; v_from numeric; v_to numeric; v_acc uuid; v_covered numeric;
+  r requests%rowtype; v_from numeric; v_to numeric; v_acc uuid; v_covered numeric; v_since date;
 begin
   select * into r from requests where id = p_id for update;
   if not found then raise exception 'Request not found'; end if;
@@ -209,14 +209,19 @@ begin
     end if;
     if r.is_reset then
       v_acc := coalesce(r.to_account, r.from_account);
+      select settle_day(last_reset_at) into v_since from accounts where id = v_acc;
       update accounts set last_reset_at = r.created_at where id = v_acc;
       if coalesce(r.commission_amount, 0) > 0 then
-        -- commission was taken in this recharge: mark open commission lines as received …
-        select coalesce(sum(commission), 0) into v_covered from settlements where account_id = v_acc and status = 'due';
+        -- the recharge already took the loss commission: every commission line for this loss counts as covered
+        select coalesce(sum(commission), 0) into v_covered from settlements
+         where account_id = v_acc and (v_since is null or settle_date >= v_since);
+        update requests set status = 'cancelled', responded_by = auth.uid(), responded_at = now(),
+               response_note = 'Commission taken in reset recharge #' || r.id
+         where kind = 'commission' and status = 'pending'
+           and settlement_id in (select id from settlements where account_id = v_acc and status = 'requested');
         update settlements set status = 'received', payout = 'id', request_id = r.id, received_at = now()
-         where account_id = v_acc and status = 'due';
-        -- … and record the rest so the 11 AM settlement does not charge it again
-        if r.commission_amount - v_covered > 0 then
+         where account_id = v_acc and status in ('due', 'requested') and (v_since is null or settle_date >= v_since);
+        if r.commission_amount - v_covered > 0.004 then
           insert into settlements (account_id, vendor_id, settle_date, net_pnl, commission_pct, commission, status, payout, request_id, received_at)
           select a.id, a.vendor_id, settle_day(now()), -r.credit_amount, a.commission_pct, r.commission_amount - v_covered,
                  'received', 'id', r.id, now()
