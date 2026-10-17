@@ -27,3 +27,18 @@ Every future commit to GitHub can automatically update the live site.
 - Visual design: style.css
 - Countdown/mobile menu: script.js
 - Brochure and images: assets/
+
+## Local testing
+Requires Node.js 18+.
+
+```bash
+npm install          # one-time setup (installs into node_modules/ only)
+npm start            # serve the site at http://localhost:8080 and open it
+npm test             # run the smoke tests on desktop + mobile viewports
+npx playwright install chromium   # first time only, if no browser is installed
+npm run clean        # remove node_modules and test output
+```
+
+The tests check that the page loads without JavaScript errors, every local
+file it links to (CSS, JS, images, brochure) exists, the countdown renders,
+and the mobile menu opens.
