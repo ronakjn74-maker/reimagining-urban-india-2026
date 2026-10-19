@@ -1,9 +1,9 @@
 {
-  "name": "ID Ledger",
-  "short_name": "ID Ledger",
+  "name": "Investor Ledger",
+  "short_name": "Investor",
   "start_url": "./",
   "display": "standalone",
-  "background_color": "#f6f7f9",
-  "theme_color": "#0f766e",
+  "background_color": "#f3f5f8",
+  "theme_color": "#1b4fd8",
   "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
 }
